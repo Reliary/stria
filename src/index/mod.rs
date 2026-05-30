@@ -222,7 +222,7 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
                         }
                     }
 
-                    let is_def = if zone == 0 && crate::zone::is_definition(phrase, line) { 1 } else { 0 };
+                    let is_def = if zone == 0 && crate::zone::is_definition(phrase, line, m.start()) { 1 } else { 0 };
 
                     // Main accumulator — u64 key, no string alloc per match
                     let key = (ph, fid);

@@ -78,33 +78,42 @@ pub fn line_zone(line: &str) -> u8 {
 }
 
 /// Grammar-free definition detection: checks if phrase is followed by `(`, `<`, `[`, `=`, `:`.
-pub fn is_definition(phrase: &str, line: &str) -> bool {
-    let s = line.trim();
-    if let Some(idx) = s.find(phrase) {
-        // Word boundary before
-        if idx > 0 {
-            let pc = s.as_bytes()[idx - 1] as char;
-            if pc.is_alphanumeric() || pc == '_' || pc == '.' {
-                return false;
-            }
-        }
-        let after = s[idx + phrase.len()..].trim();
-        // Structural follows
-        if after.starts_with('(') || after.starts_with('<') || after.starts_with('[')
-            || after.starts_with('=') || after.starts_with(':') || after.starts_with('{')
-            || after.starts_with("->")
-        {
-            return true;
-        }
-        // Lowercase keyword + structural char
-        if let Some(p) = after.find(|c: char| c == '(' || c == '{' || c == '<' || c == '[') {
-            let prefix = &after[..p].trim();
-            if !prefix.is_empty() && prefix.chars().all(|c| c.is_ascii_lowercase() || c == '_') {
-                return true;
-            }
+/// Uses byte operations and the known match position — no `find()` scan, no UTF-8 decode.
+pub fn is_definition(phrase: &str, line: &str, match_start: usize) -> bool {
+    let bytes = line.as_bytes();
+    let end = match_start + phrase.len();
+    if end >= bytes.len() { return false; }
+
+    // Word boundary before the phrase
+    if match_start > 0 {
+        let prev = bytes[match_start - 1];
+        if prev.is_ascii_alphanumeric() || prev == b'_' || prev == b'.' {
+            return false;
         }
     }
+
+    // First non-whitespace char after the phrase
+    let after_slice = &bytes[end..];
+    let first_non_space = after_slice.iter().position(|&b| b != b' ' && b != b'\t');
+    let pos = first_non_space.map(|p| end + p).unwrap_or(bytes.len());
+
+    if pos < bytes.len() {
+        let c = bytes[pos];
+        if matches!(c, b'(' | b'<' | b'[' | b'=' | b':' | b'{') { return true; }
+        if c == b'-' && pos + 1 < bytes.len() && bytes[pos + 1] == b'>' { return true; }
+    }
+
     false
+}
+
+/// Legacy string-based signature for external callers that don't have match_start.
+/// Uses `find()` to locate the phrase first.
+pub fn is_definition_str(phrase: &str, line: &str) -> bool {
+    if let Some(idx) = line.find(phrase) {
+        is_definition(phrase, line, idx)
+    } else {
+        false
+    }
 }
 
 /// Extract identifier phrases from text.
