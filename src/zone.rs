@@ -12,43 +12,65 @@ static COMMENT_RE: LazyLock<Regex> = LazyLock::new(|| {
 
 /// Classify a line as 'code' (0) or 'prose' (1).
 /// Grammar-free: uses structural character frequency + comment markers.
+/// Byte-based for cache efficiency: no UTF-8 decoding on ASCII source code.
 pub fn line_zone(line: &str) -> u8 {
     let s = line.trim();
     if s.is_empty() { return 1; }
 
-    // Comment markers
-    if let Some(m) = COMMENT_RE.find(s) {
-        let marker = m.as_str().trim();
-        if marker.starts_with('#') {
-            // C preprocessor is code
-            if s.starts_with("#!") || s.starts_with("#include") || s.starts_with("#define")
-                || s.starts_with("#if") || s.starts_with("#endif")
-                || s.starts_with("#pragma") || s.starts_with("#error") || s.starts_with("#warning")
-            {
+    let bytes = s.as_bytes();
+
+    // Comment markers (byte prefix check)
+    if bytes.len() >= 1 && bytes[0] == b'/' {
+        if bytes.len() >= 2 && (bytes[1] == b'/' || bytes[1] == b'*') { return 1; }
+    }
+    if bytes.len() >= 1 && bytes[0] == b'#' {
+        if bytes.len() >= 2 && (bytes[1] == b'!') { return 0; }
+        // Check for C preprocessor
+        if bytes.len() > 2 {
+            let w2 = if bytes.len() > 2 { bytes[1..3].as_ref() } else { &[] };
+            if matches!(w2, b"in" | b"de" | b"if" | b"en" | b"pr" | b"er" | b"wa") {
                 return 0;
             }
-            return 1;
         }
-        return 1; // prose comment
+        return 1;
+    }
+    if bytes.starts_with(b"*") || bytes.starts_with(b"<!--") || bytes.starts_with(b">") {
+        return 1;
     }
 
-    // Structural character density
-    let structural = s.chars().filter(|c| "{}()[]<>;:=|&!@#$%^*-+/?\\".contains(*c)).count();
-    let lower = s.chars().filter(|c| c.is_ascii_lowercase()).count();
-    let idents = PHRASE_RE.find_iter(s).count();
-    let slen = s.len().max(1);
-    let prose_ratio = lower as f64 / slen as f64;
-    let struct_ratio = structural as f64 / slen as f64;
+    // Structural character density using byte iteration (no UTF-8 decode)
+    let mut structural = 0u32;
+    let mut lower = 0u32;
+    let mut idents = 0u32;
+    let slen = s.len().max(1) as f64;
 
-    if prose_ratio > 0.65 && struct_ratio < 0.08 && idents < 3 { return 1; }
-    if idents == 0 { return 1; }
+    for &b in bytes {
+        match b {
+            b'a'..=b'z' => lower += 1,
+            b'{' | b'}' | b'(' | b')' | b'[' | b']' | b'<' | b'>'
+            | b';' | b':' | b'=' | b'|' | b'&' | b'!' | b'@' | b'#'
+            | b'$' | b'%' | b'^' | b'*' | b'-' | b'+' | b'/' | b'?' | b'\\' => structural += 1,
+            _ => {}
+        }
+    }
 
-    // Multi-word English prose
-    let words: Vec<&str> = s.split_whitespace().collect();
-    if !words.is_empty() {
-        let avg = words.iter().map(|w| w.len()).sum::<usize>() as f64 / words.len() as f64;
-        if prose_ratio > 0.5 && avg < 6.0 && struct_ratio < 0.05 && idents < 2 {
-            return 1;
+    // Approximate ident count via PHRASE_RE (still needed for accuracy)
+    idents = PHRASE_RE.find_iter(s).count() as u32;
+
+    if slen > 0.0 {
+        let prose_ratio = lower as f64 / slen;
+        let struct_ratio = structural as f64 / slen;
+
+        if prose_ratio > 0.65 && struct_ratio < 0.08 && idents < 3 { return 1; }
+        if idents == 0 { return 1; }
+
+        // Multi-word English prose
+        let words: Vec<&str> = s.split_whitespace().collect();
+        if !words.is_empty() {
+            let avg = words.iter().map(|w| w.len()).sum::<usize>() as f64 / words.len() as f64;
+            if prose_ratio > 0.5 && avg < 6.0 && struct_ratio < 0.05 && idents < 2 {
+                return 1;
+            }
         }
     }
 

@@ -3,17 +3,38 @@ mod extract;
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 use rayon::prelude::*;
 use rusqlite::{Connection, params};
 use sha2::{Sha256, Digest};
+use fxhash::{FxHashMap, FxHasher};
 
 use crate::zone::{self, COMMON_KEYWORDS};
 
+/// Fast hash of a phrase string to u64. Collision risk for 85K phrases: ~1 in 2^32.
+/// This eliminates String allocations in the 200K-entry occs accumulator.
+fn phrase_hash(s: &str) -> u64 {
+    let mut h = FxHasher::default();
+    s.hash(&mut h);
+    h.finish()
+}
+
 /// Packed occurrence entry: [is_def, zone_code, count, first_line_no]
 type OccEntry = [i32; 4];
+
+/// Thread-local result from a parallel extraction worker.
+struct WorkerResult {
+    occs: FxHashMap<(u64, i64), OccEntry>,
+    phrase_strings: HashMap<u64, String>,
+    left_ctx: HashMap<String, HashMap<String, u32>>,
+    phrase_df: HashMap<u64, u32>,
+    token_lens: HashMap<i64, u32>,
+    content_lens: HashMap<i64, usize>,
+    comment_ratios: HashMap<i64, f64>,
+    total_phrases: u32,
+}
 
 /// Build the phrase index for a repo.
 /// Incremental: uses SHA-256 digest cache to skip unchanged files.
@@ -64,7 +85,8 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
     db.execute_batch(
         "PRAGMA synchronous = OFF;
          PRAGMA journal_mode = MEMORY;
-         PRAGMA cache_size = -200000;"
+         PRAGMA cache_size = -200000;
+         PRAGMA mmap_size = 268435456;"
     ).map_err(|e| format!("pragma: {}", e))?;
 
     let is_full_rebuild = changed_files.len() as f64 >= files.len() as f64 * 0.3 || !db_path.exists() || digest_cache.is_empty();
@@ -76,15 +98,15 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
         changed_files.iter().map(|(rel, _)| rel.clone()).collect()
     };
 
-    // Accumulators
-    let occs = Arc::new(Mutex::new(HashMap::<(String, i64), OccEntry>::new()));
-    let left_ctx = Arc::new(Mutex::new(HashMap::<String, HashMap<String, u32>>::new()));
-    let phrase_df = Arc::new(Mutex::new(HashMap::<String, u32>::new()));
-    let file_token_lens = Arc::new(Mutex::new(HashMap::<i64, u32>::new()));
-    let file_content_lens = Arc::new(Mutex::new(HashMap::<i64, usize>::new()));
-    let file_comment_ratios = Arc::new(Mutex::new(HashMap::<i64, f64>::new()));
-    let global_total_phrases = Arc::new(Mutex::new(0u32));
-    let global_file_map = Arc::new(Mutex::new(Vec::<(i64, String)>::new()));
+    // Accumulators — plain maps, merged from WorkerResult after parallel extraction
+    let mut occs: FxHashMap<(u64, i64), OccEntry> = FxHashMap::default();
+    let mut phrase_strings: HashMap<u64, String> = HashMap::new();
+    let mut phrase_left_ctx: HashMap<String, HashMap<String, u32>> = HashMap::new();
+    let mut phrase_df_counter: HashMap<u64, u32> = HashMap::new();
+    let mut file_token_lens: HashMap<i64, u32> = HashMap::new();
+    let mut file_content_lens: HashMap<i64, usize> = HashMap::new();
+    let mut file_comment_ratios: HashMap<i64, f64> = HashMap::new();
+    let mut global_total_phrases: u32 = 0;
 
     let chunk_size = (source_files.len() / rayon::current_num_threads().max(1)).max(1);
     let chunks: Vec<&[String]> = source_files.chunks(chunk_size).collect();
@@ -140,24 +162,21 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
         changed_files.iter().map(|(rel, _)| rel.as_str()).collect()
     };
 
-    let repo_arc = Arc::new(repo);
-    let file_map_arc = Arc::new(file_map.clone());
-
-    // Parallel extraction
-    source_files.par_chunks(chunk_size).for_each(|chunk| {
-        let repo = repo_arc.clone();
-        let file_map_ref = file_map_arc.clone();
-        let occs_local = Arc::clone(&occs);
-        let left_ctx_local = Arc::clone(&left_ctx);
-        let phrase_df_local = Arc::clone(&phrase_df);
-        let ftl_local = Arc::clone(&file_token_lens);
-        let fcl_local = Arc::clone(&file_content_lens);
-        let fcr_local = Arc::clone(&file_comment_ratios);
-        let total_local = Arc::clone(&global_total_phrases);
-        let fm_local = Arc::clone(&global_file_map);
-
-        // Build file_id map for this chunk
-        let file_id_map: HashMap<&str, i64> = file_map_ref.iter().map(|(id, rel)| (rel.as_str(), *id)).collect();
+    // Parallel extraction — thread-local accumulators per worker, merge after.
+    // Shared read-only data wrapped in Arc for Fn compat. No per-phrase lock contention.
+    let repo_arc = std::sync::Arc::new(repo);
+    let file_map_arc = std::sync::Arc::new(file_map.clone());
+    source_files.par_chunks(chunk_size).map(|chunk| -> Result<WorkerResult, ()> {
+        let repo = repo_arc.as_path();
+        let file_id_map: HashMap<&str, i64> = file_map_arc.iter().map(|(id, rel)| (rel.as_str(), *id)).collect();
+        let mut local_occs = FxHashMap::default();
+        let mut local_phrase_strings: HashMap<u64, String> = HashMap::new();
+        let mut local_left_ctx: HashMap<String, HashMap<String, u32>> = HashMap::new();
+        let mut local_phrase_df: HashMap<u64, u32> = HashMap::new();
+        let mut local_ftl: HashMap<i64, u32> = HashMap::new();
+        let mut local_fcl: HashMap<i64, usize> = HashMap::new();
+        let mut local_fcr: HashMap<i64, f64> = HashMap::new();
+        let mut local_total = 0u32;
 
         for rel in chunk {
             let fpath = repo.join(rel);
@@ -172,11 +191,9 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
 
             let lines: Vec<&str> = text.lines().collect();
             let content_len = text.len();
-            let mut file_phrases_fast = HashSet::<String>::new();
+            let mut file_phrases_fast = HashSet::<u64>::new();
             let mut token_len = 0u32;
             let mut comment_lines = 0u32;
-            let mut phrase_lc: HashMap<String, HashMap<String, u32>> = HashMap::new();
-            let mut phrase_df_local_map: HashMap<String, u32> = HashMap::new();
 
             for (line_no, line) in lines.iter().enumerate() {
                 let s = line.trim();
@@ -189,171 +206,156 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
                 for m in crate::zone::PHRASE_RE.find_iter(line) {
                     let phrase = m.as_str();
                     if COMMON_KEYWORDS.contains(&phrase) { continue; }
-                    let pl = phrase.to_lowercase();
+                    let ph = phrase_hash(phrase);
 
-                    let is_def = if zone == 0 && crate::zone::is_definition(phrase, line) { 1 } else { 0 };
+                    // DF tracking — u64 key, no string alloc
+                    *local_phrase_df.entry(ph).or_insert(0) += 1;
 
-                    // Track df
-                    *phrase_df_local_map.entry(pl.clone()).or_insert(0) += 1;
-
-                    // LCEP tracking (simplified: track first 5)
-                    if !phrase_lc.contains_key(&pl) && phrase_df_local_map.get(&pl).copied().unwrap_or(0) <= 5 {
-                        // Find left-context word
+                    // LCEP tracking (lowercase string only for ~5000 entries)
+                    let df_count = local_phrase_df.get(&ph).copied().unwrap_or(0);
+                    if !local_left_ctx.contains_key(phrase) && df_count <= 5 {
+                        let pl = phrase.to_lowercase();
                         let before = &line[..m.start()].trim();
                         if let Some(lc) = before.split_whitespace().last() {
                             let lc = lc.chars().take(30).collect::<String>().to_lowercase();
-                            phrase_lc.entry(pl.clone()).or_default().entry(lc).and_modify(|c| *c += 1).or_insert(1);
+                            local_left_ctx.entry(pl).or_default().entry(lc).and_modify(|c| *c += 1).or_insert(1);
                         }
                     }
 
-                    // Accumulate
-                    let key = (phrase.to_string(), fid);
-                    let mut occs_map = occs_local.lock().unwrap();
-                    let entry = occs_map.entry(key).or_insert([is_def, zone as i32, 0, line_no as i32]);
+                    let is_def = if zone == 0 && crate::zone::is_definition(phrase, line) { 1 } else { 0 };
+
+                    // Main accumulator — u64 key, no string alloc per match
+                    let key = (ph, fid);
+                    let entry = local_occs.entry(key).or_insert([is_def, zone as i32, 0, line_no as i32]);
                     if is_def > entry[0] { entry[0] = is_def; }
                     if zone == 0 { entry[1] = 0; }
                     entry[2] += 1;
-                    drop(occs_map);
 
-                    if file_phrases_fast.insert(phrase.to_string()) {
+                    // Track phrase strings for later SQLite insert (only first occurrence per phrase)
+                    if !local_phrase_strings.contains_key(&ph) && !file_phrases_fast.contains(&ph) {
+                        local_phrase_strings.entry(ph).or_insert_with(|| phrase.to_string());
+                    }
+
+                    if file_phrases_fast.insert(ph) {
                         token_len += 1;
                     }
                 }
             }
 
-            // Thread-local accumulators
-            {
-                let mut left = left_ctx_local.lock().unwrap();
-                for (k, v) in phrase_lc {
-                    let entry = left.entry(k).or_default();
-                    for (ck, cv) in v {
-                        *entry.entry(ck).or_insert(0) += cv;
-                    }
-                }
-            }
-            {
-                let mut pdf = phrase_df_local.lock().unwrap();
-                for (k, v) in phrase_df_local_map {
-                    *pdf.entry(k).or_insert(0) += v;
-                }
-            }
-            {
-                let mut ftl = ftl_local.lock().unwrap();
-                ftl.insert(fid, token_len);
-            }
-            {
-                let mut fcl = fcl_local.lock().unwrap();
-                fcl.insert(fid, content_len);
-            }
-            {
-                let mut fcr = fcr_local.lock().unwrap();
-                let ratio = if lines.is_empty() { 0.0 } else { comment_lines as f64 / lines.len() as f64 };
-                fcr.insert(fid, ratio);
-            }
-            {
-                let mut tl = total_local.lock().unwrap();
-                *tl += token_len;
+            local_ftl.insert(fid, token_len);
+            local_fcl.insert(fid, content_len);
+            local_fcr.insert(fid, if lines.is_empty() { 0.0 } else { comment_lines as f64 / lines.len() as f64 });
+            local_total += token_len;
+        }
+
+        Ok(WorkerResult {
+            occs: local_occs,
+            phrase_strings: local_phrase_strings,
+            left_ctx: local_left_ctx,
+            phrase_df: local_phrase_df,
+            token_lens: local_ftl,
+            content_lens: local_fcl,
+            comment_ratios: local_fcr,
+            total_phrases: local_total,
+        })
+    }).collect::<Vec<_>>().into_iter()
+    .filter_map(|r| r.ok())
+    .for_each(|wr| {
+        // Merge results into shared accumulators
+        for (k, v) in wr.occs {
+            occs.entry(k).or_insert(v);
+        }
+        for (k, v) in wr.left_ctx {
+            let entry = phrase_left_ctx.entry(k).or_default();
+            for (ck, cv) in v {
+                *entry.entry(ck).or_insert(0) += cv;
             }
         }
+        for (k, v) in wr.phrase_df {
+            *phrase_df_counter.entry(k).or_insert(0) += v;
+        }
+        for (k, v) in wr.phrase_strings {
+            phrase_strings.entry(k).or_insert(v);
+        }
+        file_token_lens.extend(wr.token_lens);
+        file_content_lens.extend(wr.content_lens);
+        file_comment_ratios.extend(wr.comment_ratios);
+        global_total_phrases += wr.total_phrases;
     });
 
     // Merge and insert — with LCEP override phase
-    // First, compute left-context entropy for all tracked phrases
+    // Compute left-context entropy for all tracked phrases
     let mut phrase_entropy: HashMap<String, f64> = HashMap::new();
-    {
-        let left = left_ctx.lock().unwrap();
-        for (pl, ctx_counts) in left.iter() {
-            let total: u32 = ctx_counts.values().sum();
-            if total < 3 { continue; }
-            let entropy: f64 = ctx_counts.values()
-                .map(|c| { let p = *c as f64 / total as f64; -p * p.log2() })
-                .sum();
-            phrase_entropy.insert(pl.clone(), entropy);
-        }
+    for (pl, ctx_counts) in phrase_left_ctx.iter() {
+        let total: u32 = ctx_counts.values().sum();
+        if total < 3 { continue; }
+        let entropy: f64 = ctx_counts.values()
+            .map(|c| { let p = *c as f64 / total as f64; -p * p.log2() })
+            .sum();
+        phrase_entropy.insert(pl.clone(), entropy);
     }
 
-    // Build df counter from occs
-    let mut occs_df: HashMap<String, u32> = HashMap::new();
-    {
-        let occs_map = occs.lock().unwrap();
-        for ((phrase, _fid), _entry) in occs_map.iter() {
-            let pl = phrase.to_lowercase();
-            *occs_df.entry(pl).or_insert(0) += 1;
-        }
-    }
-
-    // Apply LCEP to override is_def, then build rows
+    // Apply LCEP to override is_def, then build rows.
+    // occs keys are (u64, i64) — resolve phrase strings from phrase_strings map.
     let mut rows: Vec<(String, i64, i32, String, i32, i32)> = Vec::new();
-    {
-        let occs_map = occs.lock().unwrap();
-        let pdf = phrase_df.lock().unwrap();
-        for ((phrase, fid), [is_def_orig, zone_code, count, first_line]) in occs_map.iter() {
-            let mut is_def = *is_def_orig;
-            let pl = phrase.to_lowercase();
-            let df = pdf.get(&pl).copied().unwrap_or(0);
+    for ((ph, fid), [is_def_orig, zone_code, count, first_line]) in occs.iter() {
+        let mut is_def = *is_def_orig;
+        let df = phrase_df_counter.get(ph).copied().unwrap_or(0);
+        let phrase = phrase_strings.get(ph)
+            .map(|s| s.as_str())
+            .unwrap_or("__missing__");
 
-            if *zone_code == 0 {
-                if let Some(entropy) = phrase_entropy.get(&pl) {
-                    if df < 20 && *entropy < 1.0 {
-                        is_def = 2;
-                    } else if df < 20 && *entropy < 2.0 {
-                        is_def = is_def.max(1);
-                    } else if df >= 20 && *entropy > 2.5 {
-                        is_def = 0;
-                    }
-                }
-                if is_def == 0 && !phrase_entropy.contains_key(&pl) && df < 10 {
-                    is_def = -1;
+        if *zone_code == 0 {
+            let pl = phrase.to_lowercase();
+            if let Some(entropy) = phrase_entropy.get(&pl) {
+                if df < 20 && *entropy < 1.0 {
+                    is_def = 2;
+                } else if df < 20 && *entropy < 2.0 {
+                    is_def = is_def.max(1);
+                } else if df >= 20 && *entropy > 2.5 {
+                    is_def = 0;
                 }
             }
-
-            let zone_str = if *zone_code == 0 { "code" } else { "prose" };
-            // Pack first_line as 4-byte little-endian blob for proximity
-            let line_bytes = first_line.to_le_bytes().to_vec();
-            let line_blob = line_bytes.as_slice();
-            // We need to pass line_blob — but the INSERT uses a fixed value ''.
-            // Store via the query directly:
-            rows.push((phrase.clone(), *fid, is_def, zone_str.to_string(), *count, *first_line));
+            if is_def == 0 && !phrase_entropy.contains_key(&pl) && df < 10 {
+                is_def = -1;
+            }
         }
+
+        let zone_str = if *zone_code == 0 { "code" } else { "prose" };
+        rows.push((phrase.to_string(), *fid, is_def, zone_str.to_string(), *count, *first_line));
     }
 
-    let total_phrases: u32 = {
-        let tl = global_total_phrases.lock().unwrap();
-        *tl
-    };
+    let total_phrases = global_total_phrases;
 
     // Insert into SQLite
     let tx = db.unchecked_transaction().map_err(|e| format!("tx: {}", e))?;
     let mut stmt = tx.prepare(
-        "INSERT OR REPLACE INTO phrase_occ (phrase, file_id, is_def, zone, count, line_nos)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+        "INSERT OR REPLACE INTO phrase_occ (phrase, file_id, is_def, zone, count, line_nos, zone_int)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
     ).map_err(|e| format!("prepare: {}", e))?;
 
     for (phrase, fid, is_def, zone_str, count, first_line) in &rows {
         let line_blob = first_line.to_le_bytes().to_vec();
-        stmt.execute(params![phrase, fid, is_def, zone_str, count, line_blob])
+        let zi = if zone_str == "code" { 0i32 } else { 1i32 };
+        stmt.execute(params![phrase, fid, is_def, zone_str, count, line_blob, zi])
             .map_err(|e| format!("insert: {}", e))?;
     }
     drop(stmt);
     tx.commit().map_err(|e| format!("commit: {}", e))?;
 
     // Insert file_stats
-    {
-        let ftl = file_token_lens.lock().unwrap();
-        let fcl = file_content_lens.lock().unwrap();
-        let fcr = file_comment_ratios.lock().unwrap();
-        let mut stmt = db.prepare(
-            "INSERT OR REPLACE INTO file_stats (file_id, token_len, content_len, comment_ratio)
-             VALUES (?1, ?2, ?3, ?4)"
-        ).map_err(|e| format!("prepare stats: {}", e))?;
-        for (fid, _) in &file_map {
-            let tl = ftl.get(fid).copied().unwrap_or(0) as f64;
-            let cl = fcl.get(fid).copied().unwrap_or(0) as f64;
-            let cr = fcr.get(fid).copied().unwrap_or(0.0);
-            stmt.execute(params![fid, tl, cl, cr])
-                .map_err(|e| format!("stats: {}", e))?;
-        }
+    let mut stats_stmt = db.prepare(
+        "INSERT OR REPLACE INTO file_stats (file_id, token_len, content_len, comment_ratio)
+         VALUES (?1, ?2, ?3, ?4)"
+    ).map_err(|e| format!("prepare stats: {}", e))?;
+    for (fid, _) in &file_map {
+        let tl = file_token_lens.get(fid).copied().unwrap_or(0) as f64;
+        let cl = file_content_lens.get(fid).copied().unwrap_or(0) as f64;
+        let cr = file_comment_ratios.get(fid).copied().unwrap_or(0.0);
+        stats_stmt.execute(params![fid, tl, cl, cr])
+            .map_err(|e| format!("stats: {}", e))?;
     }
+    drop(stats_stmt);
 
     // Definition uniqueness ratio
     db.execute_batch(
@@ -370,11 +372,9 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
     ).map_err(|e| format!("uniqueness: {}", e))?;
 
     // Compute avgdl
-    let ftl = file_token_lens.lock().unwrap();
-    let sum_len: u32 = ftl.values().sum();
-    let n_files = ftl.len().max(1_usize);
+    let sum_len: u32 = file_token_lens.values().sum();
+    let n_files = file_token_lens.len().max(1_usize);
     let avgdl = sum_len as f64 / n_files as f64;
-    drop(ftl);
 
     db.execute(
         "INSERT OR REPLACE INTO meta (key, value) VALUES ('avgdl', ?1)",

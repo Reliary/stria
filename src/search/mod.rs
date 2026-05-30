@@ -124,7 +124,7 @@ pub fn search_phrases(
     for st in &search_terms {
         let idf = idf_map.get(st).copied().unwrap_or(1.0);
         let mut exact_q = match db.prepare(
-            "SELECT po.file_id, po.count, po.is_def, po.zone, fs.token_len,
+            "SELECT po.file_id, po.count, po.is_def, po.zone_int, fs.token_len,
                     fs.unique_def_count, fs.total_def_count, fs.comment_ratio,
                     po.line_nos
              FROM phrase_occ po JOIN file_stats fs ON fs.file_id = po.file_id
@@ -133,24 +133,23 @@ pub fn search_phrases(
             Ok(q) => q,
             Err(_) => continue,
         };
-        let rows: Vec<_> = exact_q.query_map([st], |r| {
+        let rows_result = exact_q.query_map([st], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
                 r.get::<_, f64>(1)?,
                 r.get::<_, i32>(2)?,
-                r.get::<_, String>(3)?,
+                r.get::<_, i32>(3)?,
                 r.get::<_, f64>(4)?,
                 r.get::<_, i64>(5)?,
                 r.get::<_, i64>(6)?,
                 r.get::<_, f64>(7)?,
                 r.get::<_, Vec<u8>>(8)?,
             ))
-        }).unwrap().filter_map(|r| r.ok()).collect();
-        drop(exact_q);
-
-        for (fid, tf, is_def, zone_str, doc_len, uniq_def, total_def, comment_ratio, line_nos) in rows {
+        }).unwrap();
+        for row in rows_result.filter_map(|r| r.ok()) {
+            let (fid, tf, is_def, zone_int, doc_len, uniq_def, total_def, comment_ratio, line_nos) = row;
             let score = bm25::bm25_score(idf, tf, doc_len, avgdl);
-            let zone_mult = if zone_str == "code" { 2.0 } else { 0.25 };
+            let zone_mult = if zone_int == 0 { 2.0 } else { 0.25 };
             let def_mult = match is_def { 2 => 8.0, 1 => 5.0, -1 => 2.0, _ => 1.0 };
             let uniq_mult = if total_def > 0 && uniq_def > 0 {
                 1.0 + (uniq_def as f64 / total_def as f64) * 0.5
@@ -179,7 +178,7 @@ pub fn search_phrases(
         let idf_rare = idf.powf(1.5) * 0.3;
 
         let mut prefix_q = match db.prepare(
-            "SELECT po.file_id, po.is_def, po.zone, fs.token_len,
+            "SELECT po.file_id, po.is_def, po.zone_int, fs.token_len,
                     fs.unique_def_count, fs.total_def_count, fs.comment_ratio
              FROM phrase_occ po JOIN file_stats fs ON fs.file_id = po.file_id
              WHERE po.phrase LIKE ?1 AND po.phrase != ?2"
@@ -187,23 +186,22 @@ pub fn search_phrases(
             Ok(q) => q,
             Err(_) => continue,
         };
-        let rows: Vec<_> = prefix_q.query_map(params![&pattern, st], |r| {
+        let prefix_rows = prefix_q.query_map(params![&pattern, st], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
                 r.get::<_, i32>(1)?,
-                r.get::<_, String>(2)?,
+                r.get::<_, i32>(2)?,
                 r.get::<_, f64>(3)?,
                 r.get::<_, i64>(4)?,
                 r.get::<_, i64>(5)?,
                 r.get::<_, f64>(6)?,
             ))
-        }).unwrap().filter_map(|r| r.ok()).collect();
-        drop(prefix_q);
-
-        for (fid, is_def, zone_str, doc_len, uniq_def, total_def, comment_ratio) in rows {
+        }).unwrap();
+        for row in prefix_rows.filter_map(|r| r.ok()) {
+            let (fid, is_def, zone_int, doc_len, uniq_def, total_def, comment_ratio) = row;
             let tf = 1.0;
             let score = bm25::bm25_score(idf, tf, doc_len, avgdl);
-            let zone_mult = if zone_str == "code" { 2.0 } else { 0.25 };
+            let zone_mult = if zone_int == 0 { 2.0 } else { 0.25 };
             let def_mult = match is_def { 2 => 8.0, 1 => 5.0, -1 => 2.0, _ => 1.0 };
             let uniq_mult = if total_def > 0 && uniq_def > 0 {
                 1.0 + (uniq_def as f64 / total_def as f64) * 0.5
@@ -225,7 +223,7 @@ pub fn search_phrases(
         let excl_prefix = format!("{}%", st);
 
         let mut sub_q = match db.prepare(
-            "SELECT po.file_id, po.count, po.is_def, po.zone, fs.token_len,
+            "SELECT po.file_id, po.count, po.is_def, po.zone_int, fs.token_len,
                     fs.comment_ratio
              FROM phrase_occ po JOIN file_stats fs ON fs.file_id = po.file_id
              WHERE po.phrase LIKE ?1 AND po.phrase NOT LIKE ?2 AND po.phrase != ?3
@@ -234,21 +232,20 @@ pub fn search_phrases(
             Ok(q) => q,
             Err(_) => continue,
         };
-        let rows: Vec<_> = sub_q.query_map(params![&pattern, &excl_prefix, st], |r| {
+        let sub_rows = sub_q.query_map(params![&pattern, &excl_prefix, st], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
                 r.get::<_, f64>(1)?,
                 r.get::<_, i32>(2)?,
-                r.get::<_, String>(3)?,
+                r.get::<_, i32>(3)?,
                 r.get::<_, f64>(4)?,
                 r.get::<_, f64>(5)?,
             ))
-        }).unwrap().filter_map(|r| r.ok()).collect();
-        drop(sub_q);
-
-        for (fid, tf, is_def, zone_str, doc_len, comment_ratio) in rows {
+        }).unwrap();
+        for row in sub_rows.filter_map(|r| r.ok()) {
+            let (fid, tf, is_def, zone_int, doc_len, comment_ratio) = row;
             let score = bm25::bm25_score(idf, tf, doc_len, avgdl);
-            let zone_mult = if zone_str == "code" { 2.0 } else { 0.25 };
+            let zone_mult = if zone_int == 0 { 2.0 } else { 0.25 };
             let def_mult = match is_def { 2 => 8.0, 1 => 5.0, -1 => 2.0, _ => 1.0 };
             let comment_mult = (1.0 - comment_ratio * 0.5).max(0.5);
             let contrib = score * zone_mult * def_mult * comment_mult * idf_rare;

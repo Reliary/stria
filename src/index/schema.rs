@@ -13,6 +13,7 @@ pub fn create_schema(db: &Connection) -> rusqlite::Result<()> {
             zone TEXT DEFAULT 'code',
             count INTEGER DEFAULT 1,
             line_nos BLOB,
+            zone_int INTEGER DEFAULT 0,
             PRIMARY KEY (phrase, file_id)
         ) WITHOUT ROWID;
         CREATE TABLE IF NOT EXISTS file_stats (
@@ -28,5 +29,7 @@ pub fn create_schema(db: &Connection) -> rusqlite::Result<()> {
             value REAL
         );"
     )?;
+    // Add zone_int column if it doesn't exist (migration from old schema)
+    db.execute_batch("ALTER TABLE phrase_occ ADD COLUMN zone_int INTEGER DEFAULT 0;").ok();
     Ok(())
 }
