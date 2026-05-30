@@ -60,6 +60,7 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
     }
 
     let db = Connection::open(&db_path).map_err(|e| format!("db: {}", e))?;
+    schema::create_schema(&db).map_err(|e| format!("schema: {}", e))?;
     db.execute_batch(
         "PRAGMA synchronous = OFF;
          PRAGMA journal_mode = MEMORY;
@@ -348,42 +349,66 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
 
 fn collect_source_files(repo: &Path) -> Vec<String> {
     let mut files = Vec::new();
-    let skip_dirs: HashSet<&str> = [".git", "node_modules", "vendor", "dist", "build", "target",
-        "__pycache__", ".horizon", ".reliary", "third_party", "deps"].into();
-    let skip_prefixes: HashSet<&str> = ["scripts/", "tools/", "examples/", "testdata/",
-        "generated/", "artifacts/", "migrations/"].into();
+    let skip_dirs: HashSet<&str> = [
+        ".git", "node_modules", "vendor", "dist", "build", "target",
+        ".venv", "__pycache__", ".next", ".tox", ".eggs", "env", ".env",
+        "coverage", ".reliary", ".horizon", ".gitlab", ".circleci",
+        ".github",
+    ].into();
+    let lock_suffixes: HashSet<&str> = [
+        "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
+        "Cargo.lock", "go.sum", "Gemfile.lock", "poetry.lock",
+        "Pipfile.lock", "composer.lock", "bun.lockb",
+    ].into();
+    let valid_exts: HashSet<&str> = [
+        ".ts", ".tsx", ".js", ".jsx", ".go", ".py", ".rs", ".c", ".h",
+        ".cpp", ".hpp", ".java", ".kt", ".swift", ".rb", ".php", ".scala", ".clj",
+        ".erl", ".hrl", ".ex", ".exs", ".zig", ".nim", ".nix", ".tcl",
+        ".elm", ".hs", ".ml", ".mli", ".fs", ".v", ".purs",
+        ".md", ".rst", ".txt", ".yaml", ".yml", ".toml", ".json", ".html", ".css",
+        ".sh", ".bash", ".zsh", ".fish",
+        ".sql", ".graphql", ".proto", ".lua",
+        ".makefile", ".dockerfile",
+    ].into();
 
-    fn walk(dir: &Path, base: &Path, skip_dirs: &HashSet<&str>,
-            skip_prefixes: &HashSet<&str>, files: &mut Vec<String>) {
-        if let Ok(entries) = fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let rel = path.strip_prefix(base).unwrap_or(&path).to_string_lossy().to_string();
-                if skip_prefixes.iter().any(|p| rel.starts_with(p)) { continue; }
-                if path.is_dir() {
-                    let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
-                    if skip_dirs.contains(name.as_str()) { continue; }
-                    walk(&path, base, skip_dirs, skip_prefixes, files);
-                } else if path.is_file() {
-                    if let Some(ext) = path.extension() {
-                        let ext = ext.to_string_lossy().to_lowercase();
-                        if matches!(ext.as_str(), "ts"|"tsx"|"js"|"jsx"|"go"|"py"|"rs"|"c"|"h"
-                            |"cpp"|"hpp"|"java"|"kt"|"swift"|"rb"|"php"|"scala"|"clj"
-                            |"erl"|"hrl"|"ex"|"exs"|"zig"|"nim"|"nix"|"tcl"
-                            |"elm"|"hs"|"ml"|"mli"|"fs"|"v"|"purs"
-                            |"md"|"rst"|"txt"|"yaml"|"yml"|"toml"|"json"|"html"|"css"
-                            |"sh"|"bash"|"zsh"|"fish"|"makefile"|"dockerfile"
-                            |"sql"|"graphql"|"proto"|"lua"
-                        ) {
-                            files.push(rel);
+    let mut stack: Vec<PathBuf> = vec![repo.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = match fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                if skip_dirs.contains(name.as_str()) || name.starts_with('.') {
+                    continue;
+                }
+                stack.push(path);
+            } else if path.is_file() {
+                // Check lock files
+                let fname = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                if lock_suffixes.contains(fname.as_str()) {
+                    continue;
+                }
+                // Check extension
+                if let Some(ext) = path.extension() {
+                    let ext = format!(".{}", ext.to_string_lossy().to_lowercase());
+                    if !valid_exts.contains(ext.as_str()) {
+                        // Also check for extensionless files like Makefile/Dockerfile
+                        if !fname.to_lowercase().ends_with("makefile") && !fname.to_lowercase().ends_with("dockerfile") {
+                            continue;
                         }
                     }
+                } else {
+                    continue; // no extension at all
                 }
+                let rel = path.strip_prefix(repo).unwrap_or(&path).to_string_lossy().to_string();
+                files.push(rel);
             }
         }
     }
 
-    walk(repo, repo, &skip_dirs, &skip_prefixes, &mut files);
     files.sort();
     files
 }

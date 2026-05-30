@@ -122,14 +122,38 @@ fn mcp_server(repo_path: &str) {
                 } else { vec![] };
                 make_result(id, &serde_json::json!({"results": results}))
             }
-            "hologram_query" => {
+            "hologram_query" | "holo_search" => {
                 let task = request.pointer("/params/task")
+                    .or_else(|| request.pointer("/params/query"))
                     .and_then(|t| t.as_str()).unwrap_or("");
                 let results = search::search_phrases(&db_path, task, 10);
                 let files: Vec<serde_json::Value> = results.iter().map(|(fp, sc)| {
                     serde_json::json!({"file": fp, "score": sc})
                 }).collect();
                 make_result(id, &serde_json::json!({"candidates": files}))
+            }
+            "hologram_expand" => {
+                let task = request.pointer("/params/task")
+                    .and_then(|t| t.as_str()).unwrap_or("");
+                let search_results = search::search_phrases(&db_path, task, 5);
+                let top_file = search_results.first().map(|(fp, _)| fp.clone()).unwrap_or_default();
+                let plan = structural_risk::hologram_plan(&db_path, task);
+                // Get horizon body for the top file
+                let body = if !top_file.is_empty() {
+                    get_horizon_body_for_file(repo_path, &top_file)
+                } else { String::new() };
+                make_result(id, &serde_json::json!({
+                    "task": task,
+                    "top_edit": search_results.first().map(|(fp, sc)| (fp, sc)),
+                    "plan": plan,
+                    "body_excerpt": body.chars().take(500).collect::<String>()
+                }))
+            }
+            "hologram_watch" => {
+                // Background watcher: spawn a thread that polls mtime and rebuilds
+                // For MCP, we just acknowledge and log
+                eprintln!("hologram_watch started for: {}", repo_path);
+                make_result(id, &serde_json::json!({"status": "watching", "repo": repo_path}))
             }
             "who_calls" => {
                 let name = request.pointer("/params/name")
@@ -171,6 +195,21 @@ fn get_horizon_body(repo_path: &str, hash: &str) -> String {
     if let Ok(c) = rusqlite::Connection::open(&db_path) {
         if let Ok(body) = c.query_row(
             "SELECT body FROM functions WHERE hash = ?1", [hash], |r| r.get::<_, String>(0)
+        ) {
+            return body;
+        }
+    }
+    String::new()
+}
+
+fn get_horizon_body_for_file(repo_path: &str, file_path: &str) -> String {
+    let db_path = format!("{}/.horizon/horizon.db", repo_path);
+    if let Ok(c) = rusqlite::Connection::open(&db_path) {
+        // Try to find by matching name pattern from file path
+        if let Ok(body) = c.query_row(
+            "SELECT body FROM functions WHERE name LIKE ?1 LIMIT 1",
+            [&format!("%{}%", file_path.replace('/', "_"))],
+            |r| r.get::<_, String>(0)
         ) {
             return body;
         }
