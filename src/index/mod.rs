@@ -12,8 +12,8 @@ use sha2::{Sha256, Digest};
 
 use crate::zone::{self, COMMON_KEYWORDS};
 
-/// Packed occurrence entry: [is_def, zone_code, count]
-type OccEntry = [i32; 3];
+/// Packed occurrence entry: [is_def, zone_code, count, first_line_no]
+type OccEntry = [i32; 4];
 
 /// Build the phrase index for a repo.
 /// Incremental: uses SHA-256 digest cache to skip unchanged files.
@@ -209,7 +209,7 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
                     // Accumulate
                     let key = (phrase.to_string(), fid);
                     let mut occs_map = occs_local.lock().unwrap();
-                    let entry = occs_map.entry(key).or_insert([is_def, zone as i32, 0]);
+                    let entry = occs_map.entry(key).or_insert([is_def, zone as i32, 0, line_no as i32]);
                     if is_def > entry[0] { entry[0] = is_def; }
                     if zone == 0 { entry[1] = 0; }
                     entry[2] += 1;
@@ -283,11 +283,11 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
     }
 
     // Apply LCEP to override is_def, then build rows
-    let mut rows: Vec<(String, i64, i32, String, i32)> = Vec::new();
+    let mut rows: Vec<(String, i64, i32, String, i32, i32)> = Vec::new();
     {
         let occs_map = occs.lock().unwrap();
         let pdf = phrase_df.lock().unwrap();
-        for ((phrase, fid), [is_def_orig, zone_code, count]) in occs_map.iter() {
+        for ((phrase, fid), [is_def_orig, zone_code, count, first_line]) in occs_map.iter() {
             let mut is_def = *is_def_orig;
             let pl = phrase.to_lowercase();
             let df = pdf.get(&pl).copied().unwrap_or(0);
@@ -308,7 +308,12 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
             }
 
             let zone_str = if *zone_code == 0 { "code" } else { "prose" };
-            rows.push((phrase.clone(), *fid, is_def, zone_str.to_string(), *count));
+            // Pack first_line as 4-byte little-endian blob for proximity
+            let line_bytes = first_line.to_le_bytes().to_vec();
+            let line_blob = line_bytes.as_slice();
+            // We need to pass line_blob — but the INSERT uses a fixed value ''.
+            // Store via the query directly:
+            rows.push((phrase.clone(), *fid, is_def, zone_str.to_string(), *count, *first_line));
         }
     }
 
@@ -319,17 +324,17 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
 
     // Insert into SQLite
     let tx = db.unchecked_transaction().map_err(|e| format!("tx: {}", e))?;
-    {
-        let mut stmt = tx.prepare(
-            "INSERT OR REPLACE INTO phrase_occ (phrase, file_id, is_def, zone, count, line_nos)
-             VALUES (?1, ?2, ?3, ?4, ?5, '')"
-        ).map_err(|e| format!("prepare: {}", e))?;
+    let mut stmt = tx.prepare(
+        "INSERT OR REPLACE INTO phrase_occ (phrase, file_id, is_def, zone, count, line_nos)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+    ).map_err(|e| format!("prepare: {}", e))?;
 
-        for (phrase, fid, is_def, zone_str, count) in &rows {
-            stmt.execute(params![phrase, fid, is_def, zone_str, count])
-                .map_err(|e| format!("insert: {}", e))?;
-        }
+    for (phrase, fid, is_def, zone_str, count, first_line) in &rows {
+        let line_blob = first_line.to_le_bytes().to_vec();
+        stmt.execute(params![phrase, fid, is_def, zone_str, count, line_blob])
+            .map_err(|e| format!("insert: {}", e))?;
     }
+    drop(stmt);
     tx.commit().map_err(|e| format!("commit: {}", e))?;
 
     // Insert file_stats
