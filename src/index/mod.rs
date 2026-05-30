@@ -257,14 +257,60 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
         }
     });
 
-    // Merge and insert
-    let mut rows: Vec<(String, i64, i32, String, i32)> = Vec::new();
-    let occs_map = occs.lock().unwrap();
-    for ((phrase, fid), [is_def, zone_code, count]) in occs_map.iter() {
-        let zone_str = if *zone_code == 0 { "code" } else { "prose" };
-        rows.push((phrase.clone(), *fid, *is_def, zone_str.to_string(), *count));
+    // Merge and insert — with LCEP override phase
+    // First, compute left-context entropy for all tracked phrases
+    let mut phrase_entropy: HashMap<String, f64> = HashMap::new();
+    {
+        let left = left_ctx.lock().unwrap();
+        for (pl, ctx_counts) in left.iter() {
+            let total: u32 = ctx_counts.values().sum();
+            if total < 3 { continue; }
+            let entropy: f64 = ctx_counts.values()
+                .map(|c| { let p = *c as f64 / total as f64; -p * p.log2() })
+                .sum();
+            phrase_entropy.insert(pl.clone(), entropy);
+        }
     }
-    drop(occs_map);
+
+    // Build df counter from occs
+    let mut occs_df: HashMap<String, u32> = HashMap::new();
+    {
+        let occs_map = occs.lock().unwrap();
+        for ((phrase, _fid), _entry) in occs_map.iter() {
+            let pl = phrase.to_lowercase();
+            *occs_df.entry(pl).or_insert(0) += 1;
+        }
+    }
+
+    // Apply LCEP to override is_def, then build rows
+    let mut rows: Vec<(String, i64, i32, String, i32)> = Vec::new();
+    {
+        let occs_map = occs.lock().unwrap();
+        let pdf = phrase_df.lock().unwrap();
+        for ((phrase, fid), [is_def_orig, zone_code, count]) in occs_map.iter() {
+            let mut is_def = *is_def_orig;
+            let pl = phrase.to_lowercase();
+            let df = pdf.get(&pl).copied().unwrap_or(0);
+
+            if *zone_code == 0 {
+                if let Some(entropy) = phrase_entropy.get(&pl) {
+                    if df < 20 && *entropy < 1.0 {
+                        is_def = 2;
+                    } else if df < 20 && *entropy < 2.0 {
+                        is_def = is_def.max(1);
+                    } else if df >= 20 && *entropy > 2.5 {
+                        is_def = 0;
+                    }
+                }
+                if is_def == 0 && !phrase_entropy.contains_key(&pl) && df < 10 {
+                    is_def = -1;
+                }
+            }
+
+            let zone_str = if *zone_code == 0 { "code" } else { "prose" };
+            rows.push((phrase.clone(), *fid, is_def, zone_str.to_string(), *count));
+        }
+    }
 
     let total_phrases: u32 = {
         let tl = global_total_phrases.lock().unwrap();
