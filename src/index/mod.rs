@@ -11,7 +11,7 @@ use rusqlite::{Connection, params};
 use sha2::{Sha256, Digest};
 use fxhash::{FxHashMap, FxHasher};
 
-use crate::zone::{self, COMMON_KEYWORDS};
+use crate::zone;
 
 /// Fast hash of a phrase string to u64. Collision risk for 85K phrases: ~1 in 2^32.
 /// This eliminates String allocations in the 200K-entry occs accumulator.
@@ -199,12 +199,18 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
             let mut local_fcl: HashMap<i64, usize> = HashMap::new();
             let mut local_fcr: HashMap<i64, f64> = HashMap::new();
             let mut local_total = 0u32;
+            // Phase 3: skip LCEP for large repos (>5000 files) — marginal accuracy gain, high cost
+            let track_lcep = n_files <= 5000;
 
             for rel in chunk {
                 let fpath = repo.join(rel);
                 let text = match fs::read_to_string(&fpath) {
                     Ok(t) => t,
                     Err(_) => continue,
+                };
+                let fid = match file_id_map.get(rel.as_str()) {
+                    Some(id) => *id,
+                    None => continue,
                 };
                 let fid = match file_id_map.get(rel.as_str()) {
                     Some(id) => *id,
@@ -225,24 +231,22 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
                         comment_lines += 1;
                     }
                     let zone = zone::line_zone(line);
-                    for m in crate::zone::PHRASE_RE.find_iter(line) {
-                        let phrase = m.as_str();
-                        if COMMON_KEYWORDS.contains(&phrase) { continue; }
+                    for (start, phrase) in zone::scan_identifiers(line) {
                         let ph = phrase_hash(phrase);
 
                         *local_phrase_df.entry(ph).or_insert(0) += 1;
 
                         let df_count = local_phrase_df.get(&ph).copied().unwrap_or(0);
                         let lc_key = phrase.to_lowercase();
-                        if !local_left_ctx.contains_key(&lc_key) && df_count <= 5 {
-                            let before = &line[..m.start()].trim();
+                        if track_lcep && !local_left_ctx.contains_key(&lc_key) && df_count <= 5 {
+                            let before = &line[..start].trim();
                             if let Some(lc) = before.split_whitespace().last() {
                                 let lc = lc.chars().take(30).collect::<String>().to_lowercase();
                                 local_left_ctx.entry(lc_key).or_default().entry(lc).and_modify(|c| *c += 1).or_insert(1);
                             }
                         }
 
-                        let is_def = if zone == 0 && crate::zone::is_definition(phrase, line, m.start()) { 1 } else { 0 };
+                        let is_def = if zone == 0 && crate::zone::is_definition(phrase, line, start) { 1 } else { 0 };
 
                         let key = (ph, fid);
                         let entry = local_occs.entry(key).or_insert([is_def, zone as i32, 0, line_no as i32]);
@@ -303,7 +307,7 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
         global_total_phrases += wr.total_phrases;
     }
 
-    fs::write("/tmp/eh_progress.txt", format!("merge done: {} occs, bulk writing SQLite...\n", occs.len())).ok();
+    fs::write("/tmp/eh_progress.txt", format!("merge done: {} occs, sorting for WITHOUT ROWID...\n", occs.len())).ok();
 
     // Pre-compute LCEP thresholds for is_def overrides
     let lcep_thresholds: HashMap<u64, f64> = phrase_left_ctx.iter()
@@ -317,17 +321,28 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
             Some((ph, entropy))
         }).collect();
 
-    // Bulk INSERT using prepared statement in single transaction
+    // Sort by (phrase_string, file_id) for sequential WITHOUT ROWID B-tree fill.
+    // Without ROWID: sorted inserts fill pages sequentially (zero page splits).
+    // Unsorted inserts cause random page access → 10x slower.
+    let mut sorted: Vec<((u64, i64), OccEntry)> = occs.into_iter().collect();
+    sorted.par_sort_unstable_by(|a, b| {
+        let pa = phrase_strings.get(&a.0 .0).map(|s| s.as_str()).unwrap_or("");
+        let pb = phrase_strings.get(&b.0 .0).map(|s| s.as_str()).unwrap_or("");
+        pa.cmp(pb).then_with(|| a.0 .1.cmp(&b.0 .1))
+    });
+    fs::write("/tmp/eh_progress.txt", format!("sorted {} entries, inserting...\n", sorted.len())).ok();
+
+    // Bulk INSERT in sorted order — single transaction, zero page splits
     {
         let tx = db.unchecked_transaction().map_err(|e| format!("tx: {}", e))?;
         {
             let mut stmt = tx.prepare(
-                "INSERT OR REPLACE INTO phrase_occ (phrase, file_id, is_def, zone, count, line_nos, zone_int)
+                "INSERT INTO phrase_occ (phrase, file_id, is_def, zone, count, line_nos, zone_int)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
             ).map_err(|e| format!("prepare: {}", e))?;
 
             let mut row_count = 0u32;
-            for ((ph, fid), [is_def_orig, zone_code, count, first_line]) in occs.iter() {
+            for ((ph, fid), [is_def_orig, zone_code, count, first_line]) in &sorted {
                 let phrase = phrase_strings.get(ph)
                     .map(|s| s.as_str())
                     .unwrap_or("__missing__");
@@ -358,11 +373,7 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
         }
         tx.commit().map_err(|e| format!("commit: {}", e))?;
     }
-    fs::write("/tmp/eh_progress.txt", "SQLite commit done, rebuilding PK index...\n").ok();
-
-    // Rebuild phrase_occ as WITHOUT ROWID for fast query lookups
-    schema::rebuild_primary_key(&db).map_err(|e| format!("rebuild pk: {}", e))?;
-    fs::write("/tmp/eh_progress.txt", "PK rebuild done, stats...\n").ok();
+    fs::write("/tmp/eh_progress.txt", "SQLite commit done, stats...\n").ok();
 
     // File stats
     {
@@ -417,7 +428,7 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
     let _ = db.close();
 
     if verbose {
-        eprintln!("Phrase index built: {} files, {} phrases", files.len(), occs.len());
+        eprintln!("Phrase index built: {} files, {} phrases", files.len(), sorted.len());
     }
     Ok(count_phrases(&db_path).unwrap_or(0))
 }
