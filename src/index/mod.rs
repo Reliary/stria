@@ -179,8 +179,8 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
     }
 
     // Open DB: temp file for full rebuild (atomic swap at end), real DB for incremental
+    let temp_path = out_dir.join("phrases.tmp.sqlite");
     let (db, is_swap) = if is_full_rebuild {
-        let temp_path = out_dir.join("phrases.tmp.sqlite");
         let db = Connection::open(&temp_path).map_err(|e| format!("db: {}", e))?;
         schema::create_new_db(&db).map_err(|e| format!("schema: {}", e))?;
         (db, true)
@@ -412,11 +412,30 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
     sorted.par_sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.0.1.cmp(&b.0.1)));
     fs::write("/tmp/eh_progress.txt", format!("sorted {} entries, inserting phrase_occ...\n", sorted.len())).ok();
 
-    // Compute def stats in Rust (eliminate SQL uniqueness computation)
+    // Compute def stats in Rust before sharding (eliminates need to pass back from shards)
     let mut total_def_counts: HashMap<i64, u32> = HashMap::with_capacity(file_map.len());
     let mut unique_def_counts: HashMap<i64, u32> = HashMap::with_capacity(file_map.len());
+    for ((pid, fid), [is_def_orig, zone_code, _count, _first_line]) in &sorted {
+        let mut is_def = *is_def_orig;
+        let df = df_map.get(pid).copied().unwrap_or(0);
+        if *zone_code == 0 {
+            if let Some(entropy) = entropy_by_pid.get(pid) {
+                if df < 20 && *entropy < 1.0 { is_def = 2; }
+                else if df < 20 && *entropy < 2.0 { is_def = is_def.max(1); }
+                else if df >= 20 && *entropy > 2.5 { is_def = 0; }
+            } else if df < 10 {
+                is_def = -1;
+            }
+        }
+        if is_def >= 1 {
+            *total_def_counts.entry(*fid).or_insert(0) += 1;
+            if df == 1 {
+                *unique_def_counts.entry(*fid).or_insert(0) += 1;
+            }
+        }
+    }
 
-    // Bulk INSERT phrase_occ with prepared statement (batched execute+step, no SQL recompile)
+    // Bulk INSERT phrase_occ with prepared statement
     {
         let tx = db.unchecked_transaction().map_err(|e| format!("tx: {}", e))?;
         let mut stmt = tx.prepare(
@@ -424,41 +443,24 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
         ).map_err(|e| format!("prepare: {}", e))?;
 
-        let mut row_count = 0u32;
-        let has_lcep = !lcep_thresholds.is_empty();
-
         for ((pid, fid), [is_def_orig, zone_code, count, first_line]) in &sorted {
             let mut is_def = *is_def_orig;
             let df = df_map.get(pid).copied().unwrap_or(0);
-
-            // LCEP override — only meaningful for small repos
-            if has_lcep && *zone_code == 0 {
+            if *zone_code == 0 {
                 if let Some(entropy) = entropy_by_pid.get(pid) {
                     if df < 20 && *entropy < 1.0 { is_def = 2; }
                     else if df < 20 && *entropy < 2.0 { is_def = is_def.max(1); }
                     else if df >= 20 && *entropy > 2.5 { is_def = 0; }
-                } else if df < 10 {
-                    is_def = -1;
-                }
+                } else if df < 10 { is_def = -1; }
             }
-            if is_def == 0 && *zone_code == 0 && df < 10 { is_def = -1; }
-
-            // Compute def stats during insert (no SQL needed)
             if is_def >= 1 {
                 *total_def_counts.entry(*fid).or_insert(0) += 1;
-                if df == 1 {
-                    *unique_def_counts.entry(*fid).or_insert(0) += 1;
-                }
+                if df == 1 { *unique_def_counts.entry(*fid).or_insert(0) += 1; }
             }
 
             let line_bytes = first_line.to_le_bytes();
             stmt.execute(rusqlite::params![pid, fid, is_def, zone_code, count, &line_bytes[..]])
                 .map_err(|e| format!("insert: {}", e))?;
-
-            row_count += 1;
-            if row_count % 1_000_000 == 0 {
-                fs::write("/tmp/eh_progress.txt", format!("inserting... {}M rows\n", row_count / 1_000_000)).ok();
-            }
         }
         drop(stmt);
         tx.commit().map_err(|e| format!("commit: {}", e))?;
