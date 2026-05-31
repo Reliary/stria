@@ -11,14 +11,16 @@ pub mod bm25;
 pub mod proximity;
 
 /// Path-role multiplier: /src/ = 2.0, tests = 0.6, deps/vendor = 0.3
+/// Normalizes \ to / for cross-platform comparison.
 fn path_role_mult(file_path: &str) -> f64 {
-    if file_path.contains("/src/") || file_path.starts_with("src/") { return 2.0; }
-    if file_path.contains("/test") || file_path.contains("/spec") ||
-       file_path.starts_with("test") || file_path.starts_with("spec") { return 0.6; }
-    if file_path.contains("/deps/") || file_path.contains("/vendor/") ||
-       file_path.starts_with("vendor/") || file_path.starts_with("deps/") { return 0.3; }
-    if file_path.contains("/scripts/") || file_path.starts_with("scripts/") { return 0.6; }
-    if file_path.ends_with(".md") || file_path.ends_with(".rst") || file_path.ends_with(".txt") { return 0.25; }
+    let fp = file_path.replace('\\', "/");
+    if fp.contains("/src/") || fp.starts_with("src/") { return 2.0; }
+    if fp.contains("/test") || fp.contains("/spec") ||
+       fp.starts_with("test") || fp.starts_with("spec") { return 0.6; }
+    if fp.contains("/deps/") || fp.contains("/vendor/") ||
+       fp.starts_with("vendor/") || fp.starts_with("deps/") { return 0.3; }
+    if fp.contains("/scripts/") || fp.starts_with("scripts/") { return 0.6; }
+    if fp.ends_with(".md") || fp.ends_with(".rst") || fp.ends_with(".txt") { return 0.25; }
     1.0
 }
 

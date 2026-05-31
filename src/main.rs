@@ -55,7 +55,8 @@ fn main() {
         }
         Commands::Search { horizon, query, top_n } => {
             let db_path = Path::new(&horizon).join("phrases.sqlite");
-            let db_str = db_path.to_str().unwrap_or("/tmp/nonexistent.sqlite");
+            let fallback = std::env::temp_dir().join("nonexistent.sqlite");
+            let db_str = db_path.to_str().unwrap_or(fallback.to_str().unwrap_or(""));
             let results = search::search_phrases(
                 db_str,
                 &query,
@@ -88,7 +89,9 @@ fn mcp_server(repo_path: &str) {
     use std::io::{self, BufRead, Write};
     use serde_json::{json, Value};
 
-    let db_path = format!("{}/.horizon/phrases.sqlite", repo_path);
+    let db_path = std::path::Path::new(repo_path)
+        .join(".horizon").join("phrases.sqlite")
+        .to_str().unwrap_or("").to_string();
     let mut initialized = false;
 
     let tools = json!([
@@ -283,9 +286,10 @@ fn mcp_server(repo_path: &str) {
                     "find_hash" => {
                         let search_name = request.pointer("/params/arguments/name")
                             .and_then(|n| n.as_str()).unwrap_or("");
-                        let results: Vec<(String, String)> = if let Ok(c) = rusqlite::Connection::open(
-                            &format!("{}/.horizon/horizon.db", repo_path)
-                        ) {
+                        let horizon_db = std::path::Path::new(repo_path)
+                            .join(".horizon").join("horizon.db")
+                            .to_str().unwrap_or("").to_string();
+                        let results: Vec<(String, String)> = if let Ok(c) = rusqlite::Connection::open(&horizon_db) {
                             if let Ok(mut stmt) = c.prepare(
                                 "SELECT hash, name FROM functions WHERE name LIKE ?1 LIMIT 20"
                             ) {
@@ -386,7 +390,9 @@ fn mcp_server(repo_path: &str) {
 }
 
 fn get_horizon_body(repo_path: &str, hash: &str) -> String {
-    let db_path = format!("{}/.horizon/horizon.db", repo_path);
+    let db_path = std::path::Path::new(repo_path)
+        .join(".horizon").join("horizon.db")
+        .to_str().unwrap_or("").to_string();
     if let Ok(c) = rusqlite::Connection::open(&db_path) {
         if let Ok(body) = c.query_row(
             "SELECT body FROM functions WHERE hash = ?1", [hash], |r| r.get::<_, String>(0)
@@ -398,7 +404,9 @@ fn get_horizon_body(repo_path: &str, hash: &str) -> String {
 }
 
 fn get_horizon_body_for_file(repo_path: &str, file_path: &str) -> String {
-    let db_path = format!("{}/.horizon/horizon.db", repo_path);
+    let db_path = std::path::Path::new(repo_path)
+        .join(".horizon").join("horizon.db")
+        .to_str().unwrap_or("").to_string();
     if let Ok(c) = rusqlite::Connection::open(&db_path) {
         // Try to find by matching name pattern from file path
         if let Ok(body) = c.query_row(

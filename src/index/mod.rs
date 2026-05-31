@@ -12,6 +12,11 @@ use fxhash::{FxHashMap, FxHasher};
 
 use crate::zone;
 
+fn progress(msg: &str) {
+    let p = std::env::temp_dir().join("eh_progress.txt");
+    std::fs::write(p, msg).ok();
+}
+
 /// Fast hash of a phrase string to u64. Collision risk for 85K phrases: ~1 in 2^32.
 fn phrase_hash(s: &str) -> u64 {
     let mut h = FxHasher::default();
@@ -214,13 +219,13 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
         drop(stmt);
         tx.commit().map_err(|e| format!("commit file_map: {}", e))?;
     }
-    fs::write("/tmp/eh_progress.txt", "file_map done\n").ok();
+    progress("file_map done");
 
     // Parallel extraction
     let n_files = source_files.len();
     let n_workers = rayon::current_num_threads();
     let chunk_size = (n_files / n_workers.max(1)).max(1);
-    fs::write("/tmp/eh_progress.txt", format!("extraction: {} files, {} threads\n", n_files, n_workers)).ok();
+        progress(&format!("extraction: {} files, {} threads", n_files, n_workers));
 
     let repo_arc = std::sync::Arc::new(repo);
     let file_id_map: HashMap<&str, i64> = file_map.iter().map(|(id, rel)| (rel.as_str(), *id)).collect();
@@ -326,7 +331,7 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
             })
         }).collect();
 
-    fs::write("/tmp/eh_progress.txt", format!("extraction done: {} worker results\n", results.len())).ok();
+        progress(&format!("extraction done: {} worker results", results.len()));
 
     // Pre-allocate to prevent rehash thrash (24M entries × 12 rehashes = 12s)
     let est_occs: usize = std::cmp::max(n_files * 20, results.iter().map(|wr| wr.occs.len()).sum());
@@ -353,7 +358,7 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
         global_total_phrases += wr.total_phrases;
     }
 
-    fs::write("/tmp/eh_progress.txt", format!("merge done: {} occs, building phrase table...\n", occs.len())).ok();
+        progress(&format!("merge done: {} occs, building phrase table...", occs.len()));
 
     // Build phrase table: assign integer IDs to unique phrases
     // Sort by phrase string for deterministic output
@@ -409,7 +414,7 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
         }
     }
     sorted.par_sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.0.1.cmp(&b.0.1)));
-    fs::write("/tmp/eh_progress.txt", format!("sorted {} entries, inserting phrase_occ...\n", sorted.len())).ok();
+        progress(&format!("sorted {} entries, inserting phrase_occ...", sorted.len()));
 
     // Compute def stats in Rust before sharding (eliminates need to pass back from shards)
     let mut total_def_counts: HashMap<i64, u32> = HashMap::with_capacity(file_map.len());
@@ -471,7 +476,7 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
         drop(overflow_stmt);
         tx.commit().map_err(|e| format!("commit: {}", e))?;
     }
-    fs::write("/tmp/eh_progress.txt", "phrase_occ done, stats...\n").ok();
+        progress("phrase_occ done, stats...");
 
     // File stats (using Rust-computed def counts, no SQL needed)
     {
@@ -585,7 +590,8 @@ fn collect_source_files(repo: &Path) -> Vec<String> {
         if let Some(ext) = entry.path().extension() {
             let ext = format!(".{}", ext.to_string_lossy().to_lowercase());
             if valid_exts.contains(ext.as_str()) {
-                let rel = entry.path().strip_prefix(repo).unwrap_or(entry.path()).to_string_lossy().to_string();
+                let rel = entry.path().strip_prefix(repo).unwrap_or(entry.path())
+                    .to_string_lossy().to_string().replace('\\', "/");
                 files.push(rel);
             } else if !fname.to_lowercase().ends_with("makefile") && !fname.to_lowercase().ends_with("dockerfile") {
                 continue;

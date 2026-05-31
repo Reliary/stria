@@ -102,7 +102,9 @@ pub fn latent_deps(db_path: &str, file: &str) -> Vec<(String, f64)> {
     if fid.is_none() { db.close().ok(); return vec![]; }
     let fid = fid.unwrap();
     let fp = file.to_string();
-    let module = fp.rsplitn(2, '/').last().unwrap_or(&fp).to_string();
+    let module = std::path::Path::new(&fp).parent()
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_default();
 
     // Find rare phrases (df <= 3) that this file defines — unpack is_def in Rust
     let mut rare_q = db.prepare(
@@ -140,7 +142,9 @@ pub fn latent_deps(db_path: &str, file: &str) -> Vec<(String, f64)> {
             r.get::<_, String>(0)
         }).unwrap();
         for row in rows.flatten() {
-            let other_module = row.rsplitn(2, '/').last().unwrap_or(&row).to_string();
+            let other_module = std::path::Path::new(&row).parent()
+                .map(|p| p.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_default();
             if other_module != module {
                 *score_map.entry(row).or_insert(0.0) += 1.0;
             }
@@ -302,11 +306,12 @@ pub fn find_fixtures(db_path: &str, source_file: &str, test_file: &str) -> Vec<(
             for row in rows.flatten() {
                 let (phrase, fp) = row;
                 // Mechanical path filter: skip docs, artifacts, lockfiles, configs
-                let skip = fp.ends_with(".md") || fp.ends_with(".json") || fp.ends_with(".yml")
-                    || fp.ends_with(".yaml") || fp.ends_with(".toml") || fp.ends_with(".txt")
-                    || fp.ends_with(".html") || fp.ends_with(".css")
-                    || fp.starts_with("artifacts/") || fp.starts_with("node_modules/")
-                    || fp.contains("web/templates") || fp.contains("BACKLOG") || fp.contains("CRITICAL");
+                let fp_norm = fp.replace('\\', "/");
+                let skip = fp_norm.ends_with(".md") || fp_norm.ends_with(".json") || fp_norm.ends_with(".yml")
+                    || fp_norm.ends_with(".yaml") || fp_norm.ends_with(".toml") || fp_norm.ends_with(".txt")
+                    || fp_norm.ends_with(".html") || fp_norm.ends_with(".css")
+                    || fp_norm.starts_with("artifacts/") || fp_norm.starts_with("node_modules/")
+                    || fp_norm.contains("web/templates") || fp_norm.contains("BACKLOG") || fp_norm.contains("CRITICAL");
                 if !skip {
                     results.push((phrase, fp));
                 }
