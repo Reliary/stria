@@ -55,8 +55,9 @@ fn main() {
         }
         Commands::Search { horizon, query, top_n } => {
             let db_path = Path::new(&horizon).join("phrases.sqlite");
+            let db_str = db_path.to_str().unwrap_or("/tmp/nonexistent.sqlite");
             let results = search::search_phrases(
-                db_path.to_str().unwrap(),
+                db_str,
                 &query,
                 top_n,
             );
@@ -66,9 +67,10 @@ fn main() {
         }
         Commands::Serve { repo } => {
             let repo_path = Path::new(&repo);
-            let out_dir = repo_path.join(".horizon");
+            let canonical = repo_path.canonicalize().unwrap_or_else(|_| repo_path.to_path_buf());
+            let out_dir = canonical.join(".horizon");
             if !out_dir.join("phrases.sqlite").exists() {
-                match index::build_phrase_index(&repo, &out_dir, false) {
+                match index::build_phrase_index(canonical.to_str().unwrap_or(&repo), &out_dir, false) {
                     Ok(n) => eprintln!("Index built: {} phrases", n),
                     Err(e) => {
                         eprintln!("Index build failed: {}", e);
@@ -76,8 +78,8 @@ fn main() {
                     }
                 }
             }
-            eprintln!("Event Horizon MCP server starting for repo: {}", repo);
-            mcp_server(&repo);
+            eprintln!("Event Horizon MCP server starting for repo: {}", canonical.display());
+            mcp_server(canonical.to_str().unwrap_or(&repo));
         }
     }
 }
@@ -132,6 +134,8 @@ fn mcp_server(repo_path: &str) {
             }
             "tools/call" => {
                 let name = request.pointer("/params/name").and_then(|n| n.as_str()).unwrap_or("");
+                let req_start = std::time::Instant::now();
+                const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
                 let result = match name {
                     "orient" => {
                         let n_files: i64 = if let Ok(db) = rusqlite::Connection::open(&db_path) {
@@ -219,18 +223,27 @@ fn mcp_server(repo_path: &str) {
                             let coupled: Vec<Value> = plan.get("coupled").and_then(|v| v.as_array()).map(|arr| {
                                 arr.iter().filter_map(|v| v.as_str()).map(|fp| json!(fp)).collect()
                             }).unwrap_or_default();
-                            let response_obj = response.as_object_mut().unwrap();
-                            response_obj.insert("read_order".to_string(), json!(read_order));
-                            response_obj.insert("coupled".to_string(), json!(coupled));
-                            let fixtures = plan.get("fixtures").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-                            response_obj.insert("fixtures".to_string(), json!(fixtures));
+                            if let Some(response_obj) = response.as_object_mut() {
+                                response_obj.insert("read_order".to_string(), json!(read_order));
+                                response_obj.insert("coupled".to_string(), json!(coupled));
+                                let fixtures = plan.get("fixtures").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+                                response_obj.insert("fixtures".to_string(), json!(fixtures));
+                            }
                         }
 
                         // Tier 3: expand_full — add caller chains and latent deps
                         if expand_full {
+                            // Check deadline before expensive work
+                            if req_start.elapsed() > TIMEOUT {
+                                if let Some(response_obj) = response.as_object_mut() {
+                                    response_obj.insert("warning".to_string(), json!("request timed out before expand_full"));
+                                }
+                            } else {
                             let task_phrases = crate::zone::extract_phrases(task);
+                            let task_phrases: Vec<String> = task_phrases.into_iter().take(10).collect();
                             let mut all_callers: HashMap<String, f64> = HashMap::new();
                             for phrase in &task_phrases {
+                                if req_start.elapsed() > TIMEOUT { break; }
                                 for (fp, score) in structural_risk::who_calls(&db_path, phrase) {
                                     *all_callers.entry(fp).or_insert(0.0) += score;
                                 }
@@ -239,13 +252,19 @@ fn mcp_server(repo_path: &str) {
                             caller_vec.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
                             let caller_paths: Vec<Value> = caller_vec.iter().take(5).map(|(fp, _)| json!(fp)).collect();
 
-                            let response_obj = response.as_object_mut().unwrap();
-                            response_obj.insert("who_calls".to_string(), json!(caller_paths));
+                            if let Some(response_obj) = response.as_object_mut() {
+                                response_obj.insert("who_calls".to_string(), json!(caller_paths));
+                            }
 
-                            if let Some((top_fp, _)) = search_results.first() {
-                                let deps = structural_risk::latent_deps(&db_path, top_fp);
-                                let dep_paths: Vec<Value> = deps.iter().take(5).map(|(fp, _)| json!(fp)).collect();
-                                response_obj.insert("hidden_deps".to_string(), json!(dep_paths));
+                            if req_start.elapsed() <= TIMEOUT {
+                                if let Some((top_fp, _)) = search_results.first() {
+                                    let deps = structural_risk::latent_deps(&db_path, top_fp);
+                                    let dep_paths: Vec<Value> = deps.iter().take(5).map(|(fp, _)| json!(fp)).collect();
+                                    if let Some(response_obj) = response.as_object_mut() {
+                                        response_obj.insert("hidden_deps".to_string(), json!(dep_paths));
+                                    }
+                                }
+                            }
                             }
                         }
 
@@ -254,22 +273,28 @@ fn mcp_server(repo_path: &str) {
                     "expand_body" => {
                         let hash = request.pointer("/params/arguments/hash")
                             .and_then(|h| h.as_str()).unwrap_or("");
-                        let body = get_horizon_body(repo_path, hash);
+                        let mut body = get_horizon_body(repo_path, hash);
+                        if body.len() > 51200 {
+                            body.truncate(51200);
+                            body.push_str("\n// [body truncated at 50KB]");
+                        }
                         json!({"body": body})
                     }
                     "find_hash" => {
                         let search_name = request.pointer("/params/arguments/name")
                             .and_then(|n| n.as_str()).unwrap_or("");
-                        let results = if let Ok(c) = rusqlite::Connection::open(
+                        let results: Vec<(String, String)> = if let Ok(c) = rusqlite::Connection::open(
                             &format!("{}/.horizon/horizon.db", repo_path)
                         ) {
-                            let mut stmt = c.prepare(
+                            if let Ok(mut stmt) = c.prepare(
                                 "SELECT hash, name FROM functions WHERE name LIKE ?1 LIMIT 20"
-                            ).unwrap();
-                            let rows = stmt.query_map([&format!("%{}%", search_name)], |r| {
-                                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-                            }).unwrap();
-                            rows.filter_map(|r| r.ok()).collect::<Vec<_>>()
+                            ) {
+                                if let Ok(rows) = stmt.query_map([&format!("%{}%", search_name)], |r| {
+                                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                                }) {
+                                    rows.filter_map(|r| r.ok()).collect()
+                                } else { vec![] }
+                            } else { vec![] }
                         } else { vec![] };
                         json!({"results": results})
                     }
