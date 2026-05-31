@@ -165,7 +165,25 @@ fn _search_phrases(
             let s = tl[..tl.len()-4].to_string();
             if !search_terms.contains(&s) { search_terms.push(s); }
         }
-        // Expand underscore-delimited: "hub_risk_report" → sub-words + adjacent pairs
+    }
+
+    // Pre-compute DF estimates for raw query terms. Used to avoid expanding
+    // known compound terms (gen_server, make-derivation) into noisy sub-words.
+    let mut known_raw: HashMap<String, bool> = HashMap::new();
+    for t in &raw_terms {
+        let df_est: i64 = db.query_row(
+            "SELECT COUNT(*) FROM phrase_occ po JOIN phrases p ON p.id = po.phrase_id WHERE p.phrase = ?1",
+            [t], |r| r.get(0)
+        ).unwrap_or(0);
+        known_raw.insert(t.to_lowercase(), df_est > 0);
+    }
+    
+    // Underscore sub-word expansion — only for unknown (DF=0) compound terms.
+    // Known terms like gen_server (DF=331) must NOT be split into gen+server
+    // because the prefix gen% matches 61 unrelated phrases in consumer files.
+    for t in &raw_terms {
+        let tl = t.to_lowercase();
+        if known_raw.get(&tl).copied().unwrap_or(false) { continue; }
         if tl.contains('_') || tl.contains('-') {
             let sub: Vec<&str> = tl.split(|c| c == '_' || c == '-').filter(|s| s.len() >= 3).collect();
             for s in &sub {
@@ -247,7 +265,11 @@ fn _search_phrases(
         }
     }
 
-    // Tier 2: Prefix match
+    // Tier 2: Prefix match — MAX aggregation per (file, term).
+    // SUM would let files with many prefix variants (e.g. 61 gen_* phrases
+    // in asn1ct_constructed_per.erl) drown out files with few variants.
+    // MAX ensures each term contributes at most once per file — standard IR
+    // practice for expanded query terms with correlated matches.
     for st in &search_terms {
         let pattern = format!("{}%", st);
         let idf = idf_map.get(st).copied().unwrap_or(1.0);
@@ -264,6 +286,7 @@ fn _search_phrases(
             Ok(q) => q,
             Err(_) => continue,
         };
+        let mut max_per_file: HashMap<i64, f64> = HashMap::new();
         let prefix_rows = prefix_q.query_map(params![&pattern, st], |r| {
             let fid = r.get::<_, i64>(0)?;
             let flags = r.get::<_, Vec<u8>>(1)?;
@@ -285,13 +308,17 @@ fn _search_phrases(
             } else { 1.0 };
             let comment_mult = (1.0 - comment_ratio * 0.5).max(0.5);
             let contrib = score * zone_mult * def_mult * uniq_mult * comment_mult * idf_rare;
-            *file_scores.entry(fid).or_insert(0.0) += contrib;
+            let current = max_per_file.entry(fid).or_insert(0.0);
+            if contrib > *current { *current = contrib; }
+        }
+        for (fid, max_contrib) in max_per_file {
+            *file_scores.entry(fid).or_insert(0.0) += max_contrib;
             file_tiers.entry(fid).or_insert(1);
             *file_idf_sum.entry(fid).or_insert(0.0) += idf;
         }
     }
 
-    // Tier 3: Substring match
+    // Tier 3: Substring match — same MAX aggregation per (file, term).
     for st in &search_terms {
         if st.len() < 4 { continue; }
         let pattern = format!("%{}%", st);
@@ -311,6 +338,7 @@ fn _search_phrases(
             Ok(q) => q,
             Err(_) => continue,
         };
+        let mut max_per_file: HashMap<i64, f64> = HashMap::new();
         let sub_rows = sub_q.query_map(params![&pattern, &excl_prefix, st], |r| {
             let fid = r.get::<_, i64>(0)?;
             let flags = r.get::<_, Vec<u8>>(1)?;
@@ -327,7 +355,11 @@ fn _search_phrases(
             let def_mult = match is_def { 2 => 8.0, 1 => 5.0, -1 => 2.0, _ => 1.0 };
             let comment_mult = (1.0 - comment_ratio * 0.5).max(0.5);
             let contrib = score * zone_mult * def_mult * comment_mult * idf_rare;
-            *file_scores.entry(fid).or_insert(0.0) += contrib;
+            let current = max_per_file.entry(fid).or_insert(0.0);
+            if contrib > *current { *current = contrib; }
+        }
+        for (fid, max_contrib) in max_per_file {
+            *file_scores.entry(fid).or_insert(0.0) += max_contrib;
             file_tiers.entry(fid).or_insert(2);
             *file_idf_sum.entry(fid).or_insert(0.0) += idf;
         }
