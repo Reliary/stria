@@ -15,6 +15,9 @@ jobs:
         with:
           toolchain: stable
           components: clippy, rustfmt
+      - name: Install tools
+        run: |
+          cargo install cargo-audit cargo-deny 2>/dev/null
       - name: Format
         run: cargo fmt --check
       - name: Clippy
@@ -24,9 +27,7 @@ jobs:
       - name: Deny
         run: cargo deny check
       - name: Gitleaks
-        uses: gitleaks/gitleaks-action@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gitleaks detect --source . -v --no-git
       - name: Test
         run: cargo test
       - name: Build release
