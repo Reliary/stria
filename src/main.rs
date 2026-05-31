@@ -8,6 +8,7 @@ pub mod structural_risk;
 pub mod index;
 
 use std::path::Path;
+use std::collections::HashMap;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -89,12 +90,14 @@ fn mcp_server(repo_path: &str) {
     let mut initialized = false;
 
     let tools = json!([
-        {"name": "holo_search", "description": "Search phrase index for code locations", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}},
-        {"name": "cross_horizon", "description": "Expand [HORIZON: hash] to full function body", "inputSchema": {"type": "object", "properties": {"hash": {"type": "string"}}, "required": ["hash"]}},
-        {"name": "search_horizon", "description": "Find horizon hashes by function name", "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}},
-        {"name": "hologram_plan", "description": "Structural execution plan with risk and verify candidates", "inputSchema": {"type": "object", "properties": {"task": {"type": "string"}}, "required": ["task"]}},
-        {"name": "who_calls", "description": "Find callers of an identifier", "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}},
-        {"name": "latent_deps", "description": "Find hidden cross-module dependencies", "inputSchema": {"type": "object", "properties": {"file": {"type": "string"}}, "required": ["file"]}},
+        {"name": "hologram_orient", "description": "One-time session orientation. Returns tool workflow map + complete file index for ID-based encoding. Call this first. Subsequent hologram_task calls use file IDs (f0..fN) instead of paths — saves ~50t per response.", "inputSchema": {"type": "object", "properties": {}, "required": []}},
+        {"name": "hologram_task", "description": "Single composite tool for all code-search needs. Three expansion tiers: default (compact IDs, ~80t), expand_plan (+read_order/risk, ~150t), expand_full (+who_calls/latent_deps, ~250t). Use when: editing code, finding test files, checking impact. Input: task description + optional expansion flags.", "inputSchema": {"type": "object", "properties": {"task": {"type": "string", "description": "Task description (e.g. 'add retry to upload handler')"}, "expand_plan": {"type": "boolean", "description": "Include read_order and blast radius detail"}, "expand_full": {"type": "boolean", "description": "Include who_calls chains and latent deps"}}, "required": ["task"]}},
+        {"name": "holo_search", "description": "Find files by conceptual content (not filename). Use when: you know what the code does but not where it lives. Input: free-form query of 1-5 keywords. Returns: top 10 files with relevance scores.", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}},
+        {"name": "hologram_plan", "description": "Full execution plan with read_order, edit target, verify candidates, coupled files, risk level. Use when: you need detailed pre-edit guidance beyond what hologram_task default tier provides.", "inputSchema": {"type": "object", "properties": {"task": {"type": "string"}}, "required": ["task"]}},
+        {"name": "who_calls", "description": "Find all files that reference a specific identifier. Use when: refactoring a function and need to check callers. Input: exact identifier name (case-sensitive).", "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}},
+        {"name": "latent_deps", "description": "Find hidden cross-module dependencies that imports don't reveal. Use when: checking if a refactor reaches outside the current module. Input: file path relative to repo root.", "inputSchema": {"type": "object", "properties": {"file": {"type": "string"}}, "required": ["file"]}},
+        {"name": "cross_horizon", "description": "Expand a [HORIZON: hash] marker to full function body. Use when: orient output shows an horizon marker and you need to read the function source. Input: the hex hash from the marker.", "inputSchema": {"type": "object", "properties": {"hash": {"type": "string"}}, "required": ["hash"]}},
+        {"name": "search_horizon", "description": "Find horizon hashes by function name. Use when: you know a function name and need its hash for cross_horizon. Input: function name or partial name.", "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}},
     ]);
 
     for line in io::stdin().lock().lines() {
@@ -129,6 +132,131 @@ fn mcp_server(repo_path: &str) {
             "tools/call" => {
                 let name = request.pointer("/params/name").and_then(|n| n.as_str()).unwrap_or("");
                 let result = match name {
+                    "hologram_orient" => {
+                        let file_index = structural_risk::build_file_index(&db_path);
+                        json!({
+                            "file_index": file_index,
+                            "schema_version": 1,
+                            "workflows": {
+                                "pre_edit": {"tools": ["hologram_task(task=...) -> default tier", "who_calls(name=...) -> if refactoring specific API", "latent_deps(file=...) -> if cross-module"], "description": "Use hologram_task first. who_calls/latent_deps only for targeted questions."},
+                                "discovery": {"tools": ["holo_search(query=...)"], "description": "Find files when you know the concept but not the location."},
+                                "impact": {"tools": ["who_calls(name=...)", "latent_deps(file=...)"], "description": "Check callers and hidden dependencies before refactoring."}
+                            },
+                            "tool_guide": {
+                                "hologram_task": {"use_when": "editing code and need target files + test candidates", "expand_plan": "adds read_order and blast radius detail", "expand_full": "adds who_calls chains and latent deps"},
+                                "holo_search": {"use_when": "need to find files by concept (not filename)"},
+                                "hologram_plan": {"use_when": "hologram_task default tier is too brief and you need full plan"},
+                                "who_calls": {"use_when": "refactoring a specific function/type and need to check callers"},
+                                "latent_deps": {"use_when": "need hidden cross-module coupling (imports alone don't show)"},
+                                "cross_horizon": {"use_when": "a [HORIZON: hash] marker appears and you need the function body"},
+                                "search_horizon": {"use_when": "you know a function name and need its hash"}
+                            },
+                            "encoding": "File paths above use 0-based IDs (f0, f1, f2...). hologram_task returns IDs instead of paths."
+                        })
+                    }
+                    "hologram_task" => {
+                        let task = request.pointer("/params/arguments/task")
+                            .and_then(|t| t.as_str()).unwrap_or("");
+                        let expand_plan = request.pointer("/params/arguments/expand_plan")
+                            .and_then(|v| v.as_bool()).unwrap_or(false);
+                        let expand_full = request.pointer("/params/arguments/expand_full")
+                            .and_then(|v| v.as_bool()).unwrap_or(false);
+
+                        let file_index = structural_risk::build_file_index(&db_path);
+                        let mut id_map: HashMap<String, usize> = HashMap::new();
+                        for (i, fp) in file_index.iter().enumerate() {
+                            id_map.insert(fp.clone(), i);
+                        }
+
+                        // Get search results
+                        let search_results = search::search_phrases(&db_path, task, 15);
+                        let plan = structural_risk::hologram_plan(&db_path, task);
+
+                        // Default tier: compact file IDs + verify candidates + risk
+                        let top_files: Vec<Value> = search_results.iter().take(5).map(|(fp, _)| {
+                            let idx = id_map.get(fp).copied().unwrap_or(usize::MAX);
+                            json!(format!("f{}", idx))
+                        }).collect();
+
+                        let verify: Vec<Value> = plan.get("verify").and_then(|v| v.as_array()).map(|arr| {
+                            arr.iter().filter_map(|v| v.as_str()).map(|fp| {
+                                let idx = id_map.get(fp).copied().unwrap_or(usize::MAX);
+                                json!(format!("f{}", idx))
+                            }).collect()
+                        }).unwrap_or_default();
+
+                        // Use top search result for edit (hologram_plan has simpler scoring)
+                        let edit_id: Option<Value> = search_results.first().map(|(fp, _)| {
+                            let idx = id_map.get(fp).copied().unwrap_or(usize::MAX);
+                            json!(format!("f{}", idx))
+                        });
+
+                        let risk = plan.get("risk").and_then(|v| v.as_str()).unwrap_or("unknown");
+
+                        let mut response = json!({
+                            "schema_version": 1,
+                            "files": top_files,
+                            "edit": edit_id,
+                            "verify": verify,
+                            "risk": risk,
+                        });
+
+                        // Tier 2: expand_plan — add read_order and blast deps
+                        if expand_plan {
+                            let read_order: Vec<Value> = plan.get("read_first").and_then(|v| v.as_array()).map(|arr| {
+                                arr.iter().filter_map(|v| v.as_str()).map(|fp| {
+                                    let idx = id_map.get(fp).copied().unwrap_or(usize::MAX);
+                                    json!(format!("f{}", idx))
+                                }).collect()
+                            }).unwrap_or_default();
+
+                            let coupled: Vec<Value> = plan.get("coupled").and_then(|v| v.as_array()).map(|arr| {
+                                arr.iter().filter_map(|v| v.as_str()).map(|fp| {
+                                    let idx = id_map.get(fp).copied().unwrap_or(usize::MAX);
+                                    json!(format!("f{}", idx))
+                                }).collect()
+                            }).unwrap_or_default();
+
+                            let response_obj = response.as_object_mut().unwrap();
+                            response_obj.insert("read_order".to_string(), json!(read_order));
+                            response_obj.insert("coupled".to_string(), json!(coupled));
+                        }
+
+                        // Tier 3: expand_full — add caller chains and latent deps
+                        // who_calls uses task keywords as identifiers (not file paths).
+                        // latent_deps uses the top search result as the edit target.
+                        if expand_full {
+                            let task_phrases = crate::zone::extract_phrases(task);
+                            let mut all_callers: HashMap<String, f64> = HashMap::new();
+                            for phrase in &task_phrases {
+                                for (fp, score) in structural_risk::who_calls(&db_path, phrase) {
+                                    *all_callers.entry(fp).or_insert(0.0) += score;
+                                }
+                            }
+                            let mut caller_vec: Vec<(String, f64)> = all_callers.into_iter().collect();
+                            caller_vec.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                            
+                            let caller_ids: Vec<Value> = caller_vec.iter().take(5).map(|(fp, _)| {
+                                let idx = id_map.get(fp.as_str()).copied().unwrap_or(usize::MAX);
+                                json!(format!("f{}", idx))
+                            }).collect();
+
+                            let response_obj = response.as_object_mut().unwrap();
+                            response_obj.insert("who_calls".to_string(), json!(caller_ids));
+
+                            // latent_deps on top search result
+                            if let Some((top_fp, _)) = search_results.first() {
+                                let deps = structural_risk::latent_deps(&db_path, top_fp);
+                                let dep_ids: Vec<Value> = deps.iter().take(5).map(|(fp, _)| {
+                                    let idx = id_map.get(fp.as_str()).copied().unwrap_or(usize::MAX);
+                                    json!(format!("f{}", idx))
+                                }).collect();
+                                response_obj.insert("latent_deps".to_string(), json!(dep_ids));
+                            }
+                        }
+
+                        response
+                    }
                     "cross_horizon" => {
                         let hash = request.pointer("/params/arguments/hash")
                             .and_then(|h| h.as_str()).unwrap_or("");

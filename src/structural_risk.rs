@@ -196,6 +196,28 @@ fn resolve_file_path(db: &Connection, fid: i64) -> Option<String> {
     db.query_row("SELECT file_path FROM file_map WHERE id=?1", [fid], |r| r.get(0)).ok()
 }
 
+/// Build a file index: ordered list of all file paths for ID-based encoding.
+/// The agent receives this once via hologram_orient and references files by
+/// 0-based position in subsequent hologram_task calls — saving ~50 tokens
+/// per response vs repeating full paths.
+pub fn build_file_index(db_path: &str) -> Vec<String> {
+    let db = match Connection::open(db_path) {
+        Ok(d) => d,
+        Err(_) => return vec![],
+    };
+    let mut stmt = match db.prepare("SELECT file_path FROM file_map ORDER BY id") {
+        Ok(s) => s,
+        Err(_) => return vec![],
+    };
+    let files: Vec<String> = stmt.query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .filter_map(|r| r.ok())
+        .collect();
+    drop(stmt);
+    // db closes on drop
+    files
+}
+
 /// Find verification candidates: test files related to a target source file
 pub fn find_verify_candidates(db_path: &str, file: &str) -> Vec<(String, f64)> {
     let (db, fid) = match open_db_and_file(db_path, file) {
