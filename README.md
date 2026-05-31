@@ -60,7 +60,7 @@ stria watch --repo <path>     Watch for file changes and rebuild automatically
 
 Reads all source files, splits on delimiter boundaries, counts phrase frequency per file, applies left-context entropy to classify definitions versus usage. Searches use IDF-weighted exact match for precision, with BM25 prefix and substring tiers for fuzzy matching. Each file gets optional multipliers for source path, test path, dependency path, and definition density.
 
-The index is a SQLite database at `.horizon/phrases.sqlite`. The build is incremental: unchanged files cost approximately 0.02s per rebuild.
+The index is a SQLite database at `.stria/phrases.sqlite`. The build is incremental: unchanged files cost approximately 0.02s per rebuild.
 
 ## Benchmarks
 

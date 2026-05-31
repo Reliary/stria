@@ -682,7 +682,7 @@ fn collect_source_files(repo: &Path) -> Vec<String> {
         ".env",
         "coverage",
         ".reliary",
-        ".horizon",
+        ".stria",
         ".gitlab",
         ".circleci",
         ".github",

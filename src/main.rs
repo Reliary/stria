@@ -39,11 +39,17 @@ enum Commands {
     Serve {
         #[arg(long)]
         repo: String,
+        /// Override cache directory. Defaults to <repo>/.stria
+        #[arg(long)]
+        cache_dir: Option<String>,
     },
     /// Watch repo for changes and rebuild index incrementally
     Watch {
         #[arg(long)]
         repo: String,
+        /// Override cache directory. Defaults to <repo>/.stria
+        #[arg(long)]
+        cache_dir: Option<String>,
     },
     /// Detect agents and add stria MCP server entry
     Setup {
@@ -63,7 +69,7 @@ fn main() {
     match cli.command {
         Commands::Build { repo } => {
             let repo_path = Path::new(&repo);
-            let out_dir = repo_path.join(".horizon");
+            let out_dir = repo_path.join(".stria");
             match index::build_phrase_index(&repo, &out_dir, true) {
                 Ok(n) => println!("Built {} phrases", n),
                 Err(e) => eprintln!("Build failed: {}", e),
@@ -82,12 +88,18 @@ fn main() {
                 println!("{:.4}  {}", score, fp);
             }
         }
-        Commands::Serve { repo } => {
+        Commands::Serve {
+            repo,
+            cache_dir,
+        } => {
             let repo_path = Path::new(&repo);
             let canonical = repo_path
                 .canonicalize()
                 .unwrap_or_else(|_| repo_path.to_path_buf());
-            let out_dir = canonical.join(".horizon");
+            let out_dir = cache_dir
+                .as_ref()
+                .map(|c| Path::new(c).to_path_buf())
+                .unwrap_or_else(|| canonical.join(".stria"));
             if !out_dir.join("phrases.sqlite").exists() {
                 match index::build_phrase_index(
                     canonical.to_str().unwrap_or(&repo),
@@ -105,14 +117,20 @@ fn main() {
                 "stria MCP server starting for repo: {}",
                 canonical.display()
             );
-            mcp_server(canonical.to_str().unwrap_or(&repo).to_string());
+            mcp_server(canonical.to_str().unwrap_or(&repo).to_string(), &out_dir);
         }
-        Commands::Watch { repo } => {
+        Commands::Watch {
+            repo,
+            cache_dir,
+        } => {
             let repo_path = Path::new(&repo);
             let canonical = repo_path
                 .canonicalize()
                 .unwrap_or_else(|_| repo_path.to_path_buf());
-            let out_dir = canonical.join(".horizon");
+            let out_dir = cache_dir
+                .as_ref()
+                .map(|c| Path::new(c).to_path_buf())
+                .unwrap_or_else(|| canonical.join(".stria"));
             if !out_dir.join("phrases.sqlite").exists() {
                 match index::build_phrase_index(
                     canonical.to_str().unwrap_or(&repo),
@@ -140,20 +158,29 @@ fn main() {
     }
 }
 
-fn mcp_server(initial_repo: String) {
+fn mcp_server(initial_repo: String, initial_out: &std::path::Path) {
     use serde_json::{json, Value};
     use std::io::{self, BufRead, Write};
     use std::sync::Mutex;
 
-    let current_repo: Mutex<String> = Mutex::new(initial_repo);
+    struct ServerState {
+        repo: String,
+        cache_dir: std::path::PathBuf,
+    }
 
-    let db_path_of = |repo: &str| -> String {
-        std::path::Path::new(repo)
-            .join(".horizon")
-            .join("phrases.sqlite")
-            .to_str()
-            .unwrap_or("")
-            .to_string()
+    let state = Mutex::new(ServerState {
+        repo: initial_repo,
+        cache_dir: initial_out.to_path_buf(),
+    });
+
+    let db_path_of = |cache: &std::path::Path| -> String {
+        cache.join("phrases.sqlite")
+            .to_str().unwrap_or("").to_string()
+    };
+
+    let bodies_path = |cache: &std::path::Path| -> String {
+        cache.join("bodies.db")
+            .to_str().unwrap_or("").to_string()
     };
 
     let tools = json!([
@@ -204,8 +231,11 @@ fn mcp_server(initial_repo: String) {
                 json!({"jsonrpc": "2.0", "id": req_id, "result": {"tools": tools}})
             }
             "tools/call" => {
-                let repo = current_repo.lock().unwrap().clone();
-                let db_path = db_path_of(&repo);
+                let st = state.lock().unwrap();
+                let repo = st.repo.clone();
+                let cache = st.cache_dir.clone();
+                let db_path = db_path_of(&cache);
+                drop(st);
                 let name = request
                     .pointer("/params/name")
                     .and_then(|n| n.as_str())
@@ -409,7 +439,7 @@ fn mcp_server(initial_repo: String) {
                             .pointer("/params/arguments/hash")
                             .and_then(|h| h.as_str())
                             .unwrap_or("");
-                        let mut body = get_horizon_body(&repo, hash);
+                        let mut body = get_horizon_body_from(&bodies_path(&cache), hash);
                         if body.len() > 51200 {
                             body.truncate(51200);
                             body.push_str("\n// [body truncated at 50KB]");
@@ -421,14 +451,9 @@ fn mcp_server(initial_repo: String) {
                             .pointer("/params/arguments/name")
                             .and_then(|n| n.as_str())
                             .unwrap_or("");
-                        let horizon_db = std::path::Path::new(&repo)
-                            .join(".horizon")
-                            .join("horizon.db")
-                            .to_str()
-                            .unwrap_or("")
-                            .to_string();
+                        let bodies_db = bodies_path(&cache);
                         let results: Vec<(String, String)> =
-                            if let Ok(c) = rusqlite::Connection::open(&horizon_db) {
+                            if let Ok(c) = rusqlite::Connection::open(&bodies_db) {
                                 if let Ok(mut stmt) = c.prepare(
                                     "SELECT hash, name FROM functions WHERE name LIKE ?1 LIMIT 20",
                                 ) {
@@ -556,11 +581,14 @@ fn mcp_server(initial_repo: String) {
                         if canonical.is_empty() {
                             json!({"error": format!("Path not found: {}", new_path)})
                         } else {
-                            let out_dir = std::path::Path::new(&canonical).join(".horizon");
+                            let out_dir = std::path::Path::new(&canonical).join(".stria");
                             if !out_dir.join("phrases.sqlite").exists() {
                                 match index::build_phrase_index(&canonical, &out_dir, false) {
                                     Ok(n) => {
-                                        *current_repo.lock().unwrap() = canonical;
+                                        let mut st = state.lock().unwrap();
+                                        st.repo = canonical;
+                                        st.cache_dir = out_dir;
+                                        drop(st);
                                         json!({"status": "ok", "phrases": n})
                                     }
                                     Err(e) => {
@@ -568,7 +596,10 @@ fn mcp_server(initial_repo: String) {
                                     }
                                 }
                             } else {
-                                *current_repo.lock().unwrap() = canonical;
+                                let mut st = state.lock().unwrap();
+                                st.repo = canonical;
+                                st.cache_dir = out_dir;
+                                drop(st);
                                 json!({"status": "ok"})
                             }
                         }
@@ -600,14 +631,8 @@ fn mcp_server(initial_repo: String) {
     }
 }
 
-fn get_horizon_body(repo_path: &str, hash: &str) -> String {
-    let db_path = std::path::Path::new(repo_path)
-        .join(".horizon")
-        .join("horizon.db")
-        .to_str()
-        .unwrap_or("")
-        .to_string();
-    if let Ok(c) = rusqlite::Connection::open(&db_path) {
+fn get_horizon_body_from(db_path: &str, hash: &str) -> String {
+    if let Ok(c) = rusqlite::Connection::open(db_path) {
         if let Ok(body) = c.query_row("SELECT body FROM functions WHERE hash = ?1", [hash], |r| {
             r.get::<_, String>(0)
         }) {
@@ -620,8 +645,8 @@ fn get_horizon_body(repo_path: &str, hash: &str) -> String {
 #[allow(dead_code)]
 fn get_horizon_body_for_file(repo_path: &str, file_path: &str) -> String {
     let db_path = std::path::Path::new(repo_path)
-        .join(".horizon")
-        .join("horizon.db")
+        .join(".stria")
+        .join("bodies.db")
         .to_str()
         .unwrap_or("")
         .to_string();
