@@ -22,13 +22,19 @@ fn path_role_mult(file_path: &str) -> f64 {
     1.0
 }
 
-/// Filename boost: +1.5 if any search term appears in the file's path
-fn filename_boost(file_path: &str, terms: &[String]) -> f64 {
+/// Filename coverage multiplier: files whose path contains more query terms get a boost.
+/// This is principled — filenames are the most compact, intentional identifiers for code.
+fn filename_coverage(file_path: &str, search_terms: &[String], raw_terms: &[String]) -> f64 {
     let fp_lower = file_path.to_lowercase();
-    for t in terms {
-        if fp_lower.contains(t) { return 1.5; }
+    let mut matched = 0usize;
+    for t in raw_terms {
+        let tl = t.to_lowercase();
+        if fp_lower.contains(&tl) || fp_lower.contains(&tl.replace('_', "-")) || fp_lower.contains(&tl.replace('-', "_")) {
+            matched += 1;
+        }
     }
-    1.0
+    if matched == 0 || raw_terms.is_empty() { return 1.0; }
+    1.0 + matched as f64 / raw_terms.len() as f64
 }
 
 /// Unpack first_line from 4-byte little-endian BLOB
@@ -67,12 +73,9 @@ fn file_module(file_path: &str) -> String {
     }
 }
 
-/// Search the phrase index with full feature parity.
+/// Search the phrase index.
 /// Automatically re-queries with individual terms when the top result
-/// doesn't match all query terms (indicating a concentration problem).
-/// Search the phrase index with full feature parity.
-/// Automatically re-queries with individual terms when the top result
-/// doesn't match all query terms, and falls back to file path LIKE matching.
+/// doesn't span all query terms (indicating a concentration problem).
 pub fn search_phrases(
     db_path: &str,
     query: &str,
@@ -81,30 +84,27 @@ pub fn search_phrases(
     let mut results = _search_phrases(db_path, query, top_n);
     let raw_terms: Vec<String> = zone::extract_phrases(query);
     
-    // Step 1: if top result doesn't contain all query terms in its path, try IDF re-query
-    let needs_requery = if let Some((top_fp, _)) = results.first() {
-        let top_lower = top_fp.to_lowercase();
-        let terms_lower: Vec<String> = raw_terms.iter().map(|t| t.to_lowercase()).collect();
-        !terms_lower.iter().all(|t| top_lower.contains(t.as_str()))
-    } else { true };
-    
-    if needs_requery && raw_terms.len() >= 2 {
-        if let Ok(idf_db) = Connection::open(db_path) {
-            let n_docs: f64 = idf_db.query_row("SELECT COUNT(*) FROM file_map", [], |r| r.get(0)).unwrap_or(1.0);
-            let term_idfs: Vec<(usize, f64)> = raw_terms.iter().enumerate().map(|(i, t)| {
-                let df: f64 = idf_db.query_row(
-                    "SELECT COUNT(*) FROM phrase_occ po JOIN phrases p ON p.id = po.phrase_id WHERE p.phrase = ?1",
-                    [t], |r| r.get(0)
-                ).unwrap_or(0.0);
-                (i, (if df > 0.0 { ((n_docs - df + 0.5) / (df + 0.5) + 1.0).ln() } else { 10.0_f64 }))
-            }).collect();
-            
-            let best_idx = term_idfs.iter().max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-                .map(|(i, _)| *i).unwrap_or(0);
-            let best_idf = term_idfs.iter().max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-                .map(|(_, idf)| *idf).unwrap_or(0.0);
-            
-            if best_idf > 1.0 {
+    if raw_terms.len() >= 2 {
+        let needs_requery = if let Some((top_fp, _)) = results.first() {
+            let terms_lower: Vec<String> = raw_terms.iter().map(|t| t.to_lowercase()).collect();
+            let top_lower = top_fp.to_lowercase();
+            !terms_lower.iter().all(|t| top_lower.contains(t.as_str()))
+        } else { true };
+        
+        if needs_requery {
+            if let Ok(idf_db) = Connection::open(db_path) {
+                let n_docs: f64 = idf_db.query_row("SELECT COUNT(*) FROM file_map", [], |r| r.get(0)).unwrap_or(1.0);
+                let term_idfs: Vec<(usize, f64)> = raw_terms.iter().enumerate().map(|(i, t)| {
+                    let df: f64 = idf_db.query_row(
+                        "SELECT COUNT(*) FROM phrase_occ po JOIN phrases p ON p.id = po.phrase_id WHERE p.phrase = ?1",
+                        [t], |r| r.get(0)
+                    ).unwrap_or(0.0);
+                    (i, (if df > 0.0 { ((n_docs - df + 0.5) / (df + 0.5) + 1.0).ln() } else { 10.0_f64 }))
+                }).collect();
+                
+                let best_idx = term_idfs.iter().max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(|(i, _)| *i).unwrap_or(0);
+                
                 let other_terms: Vec<String> = raw_terms.iter().enumerate()
                     .filter(|(i, _)| *i != best_idx)
                     .map(|(_, t)| t.to_lowercase()).collect();
@@ -118,47 +118,12 @@ pub fn search_phrases(
                 reranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
                 reranked.truncate(top_n);
                 
-                if reranked.first().map(|(_, s)| *s).unwrap_or(0.0) > results.first().map(|(_, s)| *s).unwrap_or(0.0) * 1.1 {
+                // Use reranked if it changes the top result
+                if reranked.first().map(|(fp, _)| fp.as_str()) != results.first().map(|(fp, _)| fp.as_str()) {
                     results = reranked;
                 }
             }
         }
-    }
-    
-    // Step 2: always add file path LIKE matches as an independent bonus tier.
-    // Scores path matches proportional to the top vocabulary score × term coverage.
-    // This catches {array_list.zig, kernel.ex, janitor_test.go, gen_server.erl} etc.
-    let top_vocab_score = results.first().map(|(_, s)| *s).unwrap_or(100.0);
-    if let Ok(fp_db) = Connection::open(db_path) {
-        for t in &raw_terms {
-            let tl = t.to_lowercase();
-            for variant in [&tl, &tl.replace('_', "-"), &tl.replace('-', "_")] {
-                if let Ok(mut stmt) = fp_db.prepare(
-                    "SELECT file_path FROM file_map WHERE LOWER(file_path) LIKE ?1 LIMIT 3"
-                ) {
-                    let pattern = format!("%{}%", variant);
-                    if let Ok(rows) = stmt.query_map([&pattern], |r| r.get::<_, String>(0)) {
-                        for row in rows.flatten() {
-                            let row_lower = row.to_lowercase();
-                            let term_hits = raw_terms.iter()
-                                .filter(|t| row_lower.contains(&t.to_lowercase()))
-                                .count() as f64;
-                            let coverage = term_hits / raw_terms.len() as f64;
-                            let path_score = top_vocab_score * coverage.max(0.3);
-                            
-                            // Boost existing results or add new ones
-                            if let Some(existing) = results.iter_mut().find(|(fp, _)| fp.as_str() == row) {
-                                existing.1 = existing.1.max(path_score);
-                            } else {
-                                results.push((row, path_score));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        results.truncate(top_n);
     }
     
     results
@@ -420,7 +385,7 @@ fn _search_phrases(
         if let Some(fp) = fp_map.get(fid) {
             let mut final_score = *base_score;
             final_score *= path_role_mult(fp);
-            final_score *= filename_boost(fp, &search_terms);
+            final_score *= filename_coverage(fp, &search_terms, &raw_terms);
             let mod_path = file_module(fp);
             if let Some(mod_score) = module_scores.get(&mod_path) {
                 if *mod_score > 0.0 {
