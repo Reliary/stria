@@ -100,6 +100,7 @@ fn mcp_server(repo_path: &str) {
         {"name": "search", "description": "Find files by conceptual content (not filename). Use when: you know what the code does but not where it lives. Input: free-form query of 1-5 keywords. Returns: top 10 files with relevance scores.", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}},
         {"name": "pre_edit", "description": "Full execution plan with read_order, edit target, verify candidates, fixtures, coupled files, risk level. Use when: you need detailed pre-edit guidance beyond what code_search default tier provides.", "inputSchema": {"type": "object", "properties": {"task": {"type": "string"}}, "required": ["task"]}},
         {"name": "who_calls", "description": "Find all files that reference a specific identifier. Use when: refactoring a function and need to check callers. Input: exact identifier name (case-sensitive).", "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}},
+        {"name": "trace_callers", "description": "Find callers through N hops. depth=1 is same as who_calls, depth=2 finds callers of callers. Use when: need full impact analysis across module boundaries.", "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}, "depth": {"type": "integer", "default": 2}}, "required": ["name"]}},
         {"name": "hidden_deps", "description": "Find hidden cross-module dependencies that imports don't reveal. Use when: checking if a refactor reaches outside the current module. Input: file path relative to repo root.", "inputSchema": {"type": "object", "properties": {"file": {"type": "string"}}, "required": ["file"]}},
         {"name": "expand_body", "description": "Expand a [HORIZON: hash] marker to full function body. Use when: orient output shows an horizon marker and you need to read the function source. Input: the hex hash from the marker.", "inputSchema": {"type": "object", "properties": {"hash": {"type": "string"}}, "required": ["hash"]}},
         {"name": "find_hash", "description": "Find horizon hashes by function name. Use when: you know a function name and need its hash for expand_body. Input: function name or partial name.", "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}},
@@ -321,6 +322,14 @@ fn mcp_server(repo_path: &str) {
                         let call_name = request.pointer("/params/arguments/name")
                             .and_then(|n| n.as_str()).unwrap_or("");
                         let results = structural_risk::who_calls(&db_path, call_name);
+                        json!({"callers": results})
+                    }
+                    "trace_callers" => {
+                        let call_name = request.pointer("/params/arguments/name")
+                            .and_then(|n| n.as_str()).unwrap_or("");
+                        let depth = request.pointer("/params/arguments/depth")
+                            .and_then(|d| d.as_i64()).unwrap_or(2) as u32;
+                        let results = structural_risk::trace_callers(&db_path, call_name, depth);
                         json!({"callers": results})
                     }
                     "hidden_deps" => {

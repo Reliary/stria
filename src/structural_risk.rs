@@ -83,6 +83,44 @@ pub fn who_calls(db_path: &str, name: &str) -> Vec<(String, f64)> {
     results
 }
 
+/// Trace calls through N hops. Hop 1 = direct callers (same as who_calls).
+/// Hop 2+ follows phrase_occ edges: files sharing distinctive vocabulary
+/// with the caller are "callers of callers."
+pub fn trace_callers(db_path: &str, name: &str, depth: u32) -> Vec<(String, f64)> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut results: Vec<(String, f64)> = Vec::new();
+
+    // Hop 1: direct definitions and callers
+    let mut current = who_calls(db_path, name);
+    for (fp, score) in &current {
+        if seen.insert(fp.clone()) {
+            results.push((fp.clone(), *score));
+        }
+    }
+
+    // Hops 2+: find files that share distinctive vocabulary with each caller
+    // (latent coupling through phrase_occ edges, not direct references)
+    for _ in 2..=depth {
+        let mut next_results: Vec<(String, f64)> = Vec::new();
+        for (caller_fp, _) in &current {
+            // Find files sharing rare definition phrases with this caller
+            let deps = latent_deps(db_path, caller_fp);
+            for (fp, score) in &deps {
+                if seen.insert(fp.clone()) {
+                    // Diminishing weight per hop (0.5^hop)
+                    let hop_weight = 0.5_f64.powi((depth as i32) - 1);
+                    next_results.push((fp.clone(), score * hop_weight));
+                }
+            }
+        }
+        if next_results.is_empty() { break; }
+        results.extend(next_results.iter().cloned());
+        current = next_results;
+    }
+
+    results
+}
+
 /// Find latent dependencies: files in different modules sharing rare vocabulary.
 pub fn latent_deps(db_path: &str, file: &str) -> Vec<(String, f64)> {
     let db = match Connection::open(db_path) {
