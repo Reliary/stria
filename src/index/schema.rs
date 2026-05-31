@@ -1,25 +1,25 @@
 use rusqlite::Connection;
 
-pub fn create_new_db(db: &Connection) -> rusqlite::Result<()> {
+pub(crate) fn create_new_db(db: &Connection) -> rusqlite::Result<()> {
     db.execute_batch(
         "PRAGMA synchronous = OFF;
          PRAGMA journal_mode = MEMORY;
          PRAGMA cache_size = -200000;
          PRAGMA mmap_size = 268435456;
          PRAGMA temp_store = MEMORY;
-         PRAGMA lock_timeout = 5000;"
+         PRAGMA lock_timeout = 5000;",
     )?;
     create_tables(db)
 }
 
-pub fn open_existing_db(db: &Connection) -> rusqlite::Result<()> {
+pub(crate) fn open_existing_db(db: &Connection) -> rusqlite::Result<()> {
     db.execute_batch(
         "PRAGMA synchronous = OFF;
          PRAGMA journal_mode = MEMORY;
          PRAGMA cache_size = -200000;
          PRAGMA mmap_size = 268435456;
          PRAGMA temp_store = MEMORY;
-         PRAGMA lock_timeout = 5000;"
+         PRAGMA lock_timeout = 5000;",
     )
 }
 
@@ -57,12 +57,13 @@ fn create_tables(db: &Connection) -> rusqlite::Result<()> {
         CREATE TABLE IF NOT EXISTS meta (
             key TEXT PRIMARY KEY,
             value REAL
-        );"
+        );",
     )?;
     Ok(())
 }
 
-pub fn rebuild_primary_key(_db: &Connection) -> rusqlite::Result<()> {
+#[allow(dead_code)]
+pub(crate) fn rebuild_primary_key(_db: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
@@ -72,34 +73,39 @@ pub fn rebuild_primary_key(_db: &Connection) -> rusqlite::Result<()> {
 // count: [0..30] direct, 31 = overflow (5 bits)
 const COUNT_OVERFLOW: u8 = 31;
 
-pub fn pack_flags(is_def: i32, zone_int: i32, count: u32) -> [u8; 1] {
-    let is_def_packed = ((is_def + 1) as u8) & 0x03;        // 2 bits: -1→0, 0→1, 1→2, 2→3
-    let zone_packed = (zone_int as u8) & 0x01;               // 1 bit
-    let count_packed = if count <= 30 { count as u8 } else { COUNT_OVERFLOW };
+pub(crate) fn pack_flags(is_def: i32, zone_int: i32, count: u32) -> [u8; 1] {
+    let is_def_packed = ((is_def + 1) as u8) & 0x03; // 2 bits: -1→0, 0→1, 1→2, 2→3
+    let zone_packed = (zone_int as u8) & 0x01; // 1 bit
+    let count_packed = if count <= 30 {
+        count as u8
+    } else {
+        COUNT_OVERFLOW
+    };
     [is_def_packed | (zone_packed << 2) | (count_packed << 3)]
 }
 
-pub fn unpack_is_def(flags: u8) -> i32 {
+pub(crate) fn unpack_is_def(flags: u8) -> i32 {
     ((flags & 0x03) as i32) - 1
 }
 
-pub fn unpack_zone_int(flags: u8) -> i32 {
+pub(crate) fn unpack_zone_int(flags: u8) -> i32 {
     ((flags >> 2) & 0x01) as i32
 }
 
-pub fn unpack_count(flags: u8) -> u32 {
+pub(crate) fn unpack_count(flags: u8) -> u32 {
     (flags >> 3) as u32
 }
 
-pub fn is_count_overflow(flags: u8) -> bool {
+#[allow(dead_code)]
+pub(crate) fn is_count_overflow(flags: u8) -> bool {
     unpack_count(flags) >= COUNT_OVERFLOW as u32
 }
 
-pub fn pack_line_nos(line: u32) -> [u8; 2] {
+pub(crate) fn pack_line_nos(line: u32) -> [u8; 2] {
     (line as u16).to_le_bytes()
 }
 
-pub fn unpack_line_nos(blob: &[u8]) -> u32 {
+pub(crate) fn unpack_line_nos(blob: &[u8]) -> u32 {
     if blob.len() >= 2 {
         u16::from_le_bytes([blob[0], blob[1]]) as u32
     } else {

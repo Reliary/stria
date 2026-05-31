@@ -9,6 +9,10 @@ homepage = "https://github.com/Reliary/stria"
 keywords = ["mcp", "code-intelligence", "structural-analysis", "grammar-free", "codebase-indexing"]
 categories = ["development-tools", "command-line-utilities"]
 
+[lints.rust]
+unsafe_code = "deny"
+unreachable_pub = "warn"
+
 [dependencies]
 clap = { version = "4.6.1", features = ["derive"] }
 fxhash = "0.2.1"

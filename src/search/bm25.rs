@@ -1,13 +1,11 @@
+use regex::Regex;
 /// BM25 scoring for phrase search.
 /// Uses K1=1.2, b=0.75 with logarithmic TF scaling.
-
 use std::sync::LazyLock;
-use regex::Regex;
 
 // Regex for phrase extraction used across all modules
-pub static PHRASE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"[a-zA-Z_][a-zA-Z0-9_]{3,}").unwrap()
-});
+pub static PHRASE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"[a-zA-Z_][a-zA-Z0-9_]{3,}").unwrap());
 
 pub fn bm25_idf(n_docs: f64, df: f64) -> f64 {
     ((n_docs - df + 0.5) / (df + 0.5) + 1.0).ln()
@@ -35,7 +33,12 @@ mod tests {
     fn bm25_idf_single_doc() {
         let idf = bm25_idf(100.0_f64, 1.0_f64);
         let expected = ((100.0_f64 - 1.0_f64 + 0.5) / (1.0_f64 + 0.5) + 1.0).ln();
-        assert!((idf - expected).abs() < 1e-10, "idf={} expected={}", idf, expected);
+        assert!(
+            (idf - expected).abs() < 1e-10,
+            "idf={} expected={}",
+            idf,
+            expected
+        );
     }
 
     #[test]
@@ -43,7 +46,12 @@ mod tests {
         let idf = bm25_idf(100.0_f64, 0.0_f64);
         assert!(idf > 0.0, "idf should be positive for zero df");
         let expected = ((100.0_f64 - 0.0_f64 + 0.5) / (0.0_f64 + 0.5) + 1.0).ln();
-        assert!((idf - expected).abs() < 1e-10, "idf={} expected={}", idf, expected);
+        assert!(
+            (idf - expected).abs() < 1e-10,
+            "idf={} expected={}",
+            idf,
+            expected
+        );
     }
 
     #[test]
@@ -55,7 +63,11 @@ mod tests {
     #[test]
     fn bm25_score_zero_tf() {
         let s = bm25_score(2.0, 0.0, 50.0, 100.0);
-        assert!((s - 0.0).abs() < 1e-10, "zero tf should give zero score, got {}", s);
+        assert!(
+            (s - 0.0).abs() < 1e-10,
+            "zero tf should give zero score, got {}",
+            s
+        );
     }
 
     #[test]
@@ -68,26 +80,45 @@ mod tests {
     fn bm25_score_high_tf() {
         let s1 = bm25_score(2.0, 1.0, 50.0, 100.0);
         let s2 = bm25_score(2.0, 100.0, 50.0, 100.0);
-        assert!(s2 > s1, "higher tf should give higher score: {} vs {}", s2, s1);
+        assert!(
+            s2 > s1,
+            "higher tf should give higher score: {} vs {}",
+            s2,
+            s1
+        );
     }
 
     #[test]
     fn bm25_score_short_doc_boost() {
         let short = bm25_score(2.0, 1.0, 10.0, 100.0);
         let long = bm25_score(2.0, 1.0, 1000.0, 100.0);
-        assert!(short > long, "short doc should score higher: {} vs {}", short, long);
+        assert!(
+            short > long,
+            "short doc should score higher: {} vs {}",
+            short,
+            long
+        );
     }
 
     #[test]
     fn bm25_score_zero_avgdl() {
         let s = bm25_score(2.0, 1.0, 10.0, 0.0);
-        assert!(!s.is_nan() && !s.is_infinite(), "zero avgdl should not crash: {}", s);
+        assert!(
+            !s.is_nan() && !s.is_infinite(),
+            "zero avgdl should not crash: {}",
+            s
+        );
     }
 
     #[test]
     fn bm25_score_idf_ordering() {
         let high = bm25_score(5.0, 1.0, 50.0, 100.0);
         let low = bm25_score(1.0, 1.0, 50.0, 100.0);
-        assert!(high > low, "higher idf should score higher: {} vs {}", high, low);
+        assert!(
+            high > low,
+            "higher idf should score higher: {} vs {}",
+            high,
+            low
+        );
     }
 }

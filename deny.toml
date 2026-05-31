@@ -1,0 +1,11 @@
+[advisories]
+vulnerability = "deny"
+unmaintained = "warn"
+unsound = "deny"
+
+[licenses]
+allow = ["MIT", "Apache-2.0", "ISC", "Unicode-3.0"]
+unlicensed = "deny"
+
+[bans]
+multiple-versions = "deny"
