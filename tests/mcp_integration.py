@@ -4,7 +4,7 @@ import subprocess, json, time, sys, os
 
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 FIXTURES = os.path.join(REPO, "tests", "fixtures")
-BIN = os.path.join(REPO, "target", "release", "event-horizon")
+BIN = os.path.join(REPO, "target", "release", "stria")
 passed = 0
 failed = 0
 

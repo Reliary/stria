@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "event-horizon", about = "Grammar-free structural codebase search")]
+#[command(name = "stria", about = "Grammar-free structural codebase search")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -84,7 +84,7 @@ fn main() {
                     }
                 }
             }
-            eprintln!("Event Horizon MCP server starting for repo: {}", canonical.display());
+            eprintln!("stria MCP server starting for repo: {}", canonical.display());
             mcp_server(canonical.to_str().unwrap_or(&repo));
         }
         Commands::Watch { repo } => {
@@ -151,7 +151,7 @@ fn mcp_server(repo_path: &str) {
                     "result": {
                         "protocolVersion": "2024-11-05",
                         "capabilities": {"tools": {}},
-                        "serverInfo": {"name": "event-horizon", "version": "0.3.0"}
+                        "serverInfo": {"name": "stria", "version": "0.3.0"}
                     }
                 })
             }
