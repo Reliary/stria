@@ -145,11 +145,36 @@ fn _search_phrases(
     let raw_terms: Vec<String> = zone::extract_phrases(query);
     if raw_terms.is_empty() { return vec![]; }
 
-    // Build search_terms: lower + stem variants
+    // Build search_terms: original casing + stems
     let mut search_terms: Vec<String> = Vec::new();
     for t in &raw_terms {
+        if !search_terms.contains(t) { search_terms.push(t.clone()); }
+    }
+
+    // Pre-compute DF estimates for raw query terms. Used for two purposes:
+    // 1. DF-gated underscore expansion (known compounds NOT split into sub-words)
+    // 2. DF-gated case-variant suppression (lowercase NOT added when original
+    //    casing is in DB, preventing double-scoring through prefix tier)
+    let mut known_raw: HashMap<String, bool> = HashMap::new();
+    for t in &raw_terms {
+        let df_est: i64 = db.query_row(
+            "SELECT COUNT(*) FROM phrase_occ po JOIN phrases p ON p.id = po.phrase_id WHERE p.phrase = ?1",
+            [t], |r| r.get(0)
+        ).unwrap_or(0);
+        known_raw.insert(t.to_lowercase(), df_est > 0);
+    }
+
+    for t in &raw_terms {
         let tl = t.to_lowercase();
-        if !search_terms.contains(&tl) { search_terms.push(tl.clone()); }
+        let is_known = known_raw.get(&tl).copied().unwrap_or(false);
+        
+        // Case variant: only add lowercase if original casing is NOT in DB.
+        // Prevents ArrayList (df=200) and arraylist (df=2) from being independent
+        // search terms — the lowercase prefix tier would double-score files already
+        // matched by the exact tier.
+        if !is_known && !search_terms.contains(&tl) {
+            search_terms.push(tl.clone());
+        }
         if tl.ends_with("ing") && tl.len() > 4 {
             let s = tl[..tl.len()-3].to_string();
             if !search_terms.contains(&s) { search_terms.push(s); }
@@ -165,26 +190,11 @@ fn _search_phrases(
             let s = tl[..tl.len()-4].to_string();
             if !search_terms.contains(&s) { search_terms.push(s); }
         }
-    }
-
-    // Pre-compute DF estimates for raw query terms. Used to avoid expanding
-    // known compound terms (gen_server, make-derivation) into noisy sub-words.
-    let mut known_raw: HashMap<String, bool> = HashMap::new();
-    for t in &raw_terms {
-        let df_est: i64 = db.query_row(
-            "SELECT COUNT(*) FROM phrase_occ po JOIN phrases p ON p.id = po.phrase_id WHERE p.phrase = ?1",
-            [t], |r| r.get(0)
-        ).unwrap_or(0);
-        known_raw.insert(t.to_lowercase(), df_est > 0);
-    }
-    
-    // Underscore sub-word expansion — only for unknown (DF=0) compound terms.
-    // Known terms like gen_server (DF=331) must NOT be split into gen+server
-    // because the prefix gen% matches 61 unrelated phrases in consumer files.
-    for t in &raw_terms {
-        let tl = t.to_lowercase();
-        if known_raw.get(&tl).copied().unwrap_or(false) { continue; }
-        if tl.contains('_') || tl.contains('-') {
+        
+        // Underscore sub-word expansion — only for unknown (DF=0) compound terms.
+        // Known terms like gen_server (DF=331) must NOT be split into gen+server
+        // because the prefix gen% matches 61 unrelated phrases in consumer files.
+        if !is_known && (tl.contains('_') || tl.contains('-')) {
             let sub: Vec<&str> = tl.split(|c| c == '_' || c == '-').filter(|s| s.len() >= 3).collect();
             for s in &sub {
                 if !search_terms.iter().any(|x| x == s) { search_terms.push(s.to_string()); }

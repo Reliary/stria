@@ -2,7 +2,7 @@ use std::sync::LazyLock;
 
 /// Shared regex for identifier extraction (grammar-free, 3+ char identifiers)
 pub static PHRASE_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r"[a-zA-Z_][a-zA-Z0-9_]{3,}").unwrap()
+    regex::Regex::new(r"[a-zA-Z_][a-zA-Z0-9_]{2,}").unwrap()
 });
 
 /// Classify a line as 'code' (0) or 'prose' (1).
@@ -60,7 +60,7 @@ pub fn line_zone(line: &str) -> u8 {
                 i += 1;
                 count += 1;
             }
-            if count >= 4 { idents += 1; }
+            if count >= 3 { idents += 1; }
         } else {
             i += 1;
         }
@@ -139,7 +139,7 @@ pub fn extract_phrases(text: &str) -> Vec<String> {
     PHRASE_RE.find_iter(text).map(|m| m.as_str().to_string()).collect()
 }
 
-/// Hand-written byte scanner for [a-zA-Z_][a-zA-Z0-9_]{3,}.
+/// Hand-written byte scanner for [a-zA-Z_][a-zA-Z0-9_]{2,}.
 /// Processes at memory bandwidth (~2GB/s) vs regex DFA (~200MB/s).
 /// Zero allocations, zero state machine overhead.
 pub fn scan_identifiers(text: &str) -> impl Iterator<Item = (usize, &str)> {
@@ -160,7 +160,7 @@ pub fn scan_identifiers(text: &str) -> impl Iterator<Item = (usize, &str)> {
                     i += 1;
                     count += 1;
                 }
-                if count >= 4 {
+                if count >= 3 {
                     return Some((start, &text[start..i]));
                 }
             } else {
