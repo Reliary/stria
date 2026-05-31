@@ -1,29 +1,23 @@
 # stria
 
-Grammar-free structural codebase indexer and MCP server. Works on any language without parsers or config.
-
-## Quickstart
+Structural codebase indexer for LLMs. Sub-millisecond queries, zero parsers, any language.
 
 ```bash
 cargo install stria
 cd my-project
-stria serve --repo .
+stria setup --yes       # auto-detect: OpenCode, Claude Code, Cursor, Windsurf
+stria serve             # builds index in ~0.16s, starts MCP server
 ```
 
-That builds the index on first run (no separate `init` step), then starts an MCP server on stdin/stdout. Point your agent at it.
+The index builds on first run -- no init step, no config files, no per-language setup. Point your agent at stria and call `orient` for a repo manifest in ~80 tokens.
 
 ## Agent onboarding
 
-Add the MCP server to your agent's config. For OpenCode (`~/.config/opencode/opencode.json`):
-
-```json
-"stria": {
-  "type": "local",
-  "command": ["stria", "serve", "--repo", "/path/to/your/repo"]
-}
+```bash
+stria setup
 ```
 
-Claude Code, Cursor, and other MCP-compatible agents use similar local-server entries.
+Detects installed agents and adds a global stria entry. No manual JSON editing. One `switch_repo` MCP tool lets you change projects mid-session without restarting.
 
 When the agent starts a session, it calls `orient` first. The response includes the repo's language breakdown, a tool guide with `use_when` hints for each tool, and workflow suggestions. Then:
 
@@ -82,6 +76,14 @@ The kernel is the hard case. 72,000 files in C, assembly, Python, shell scripts,
 
 - Ranking for long definition files (the Erlang standard library `gen_server.erl` at 1,278 phrases) hits BM25 length normalization. The right file is always in the index but may rank at 10-20 instead of 1.
 - Not a linter, bug finder, or security scanner. It measures vocabulary overlap, not code correctness.
+
+## Install
+
+```bash
+cargo install stria
+```
+
+Or download a pre-built binary from the [releases page](https://github.com/Reliary/stria/releases).
 
 ## License
 
