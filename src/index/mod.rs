@@ -382,7 +382,6 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
         }
         tx.commit().map_err(|e| format!("commit phrases: {}", e))?;
     }
-    fs::write("/tmp/eh_progress.txt", format!("phrase table: {} unique phrases\n", phrase_list.len())).ok();
 
     // LCEP thresholds (for small repos only)
     let lcep_thresholds: HashMap<u64, f64> = phrase_left_ctx.iter()
