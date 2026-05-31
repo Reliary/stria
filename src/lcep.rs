@@ -35,3 +35,92 @@ pub fn classify_definition(
         None => 0,  // no data = usage
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn entropy_empty() {
+        let m: HashMap<String, u32> = HashMap::new();
+        assert_eq!(left_context_entropy(&m), None);
+    }
+
+    #[test]
+    fn entropy_few_samples() {
+        let mut m = HashMap::new();
+        m.insert("fn".to_string(), 1);
+        assert_eq!(left_context_entropy(&m), None);
+    }
+
+    #[test]
+    fn entropy_zero_entropy() {
+        let mut m = HashMap::new();
+        m.insert("fn".to_string(), 10);
+        let e = left_context_entropy(&m).unwrap();
+        assert!((e - 0.0).abs() < 1e-10, "single context should have zero entropy: {}", e);
+    }
+
+    #[test]
+    fn entropy_maximum() {
+        let mut m = HashMap::new();
+        for i in 0..8 {
+            m.insert(format!("ctx_{}", i), 1);
+        }
+        let e = left_context_entropy(&m).unwrap();
+        assert!((e - 3.0).abs() < 0.01, "8 equally-likely contexts should give 3.0 bits: {}", e);
+    }
+
+    #[test]
+    fn entropy_varied() {
+        let mut m = HashMap::new();
+        m.insert("fn".to_string(), 8);
+        m.insert("let".to_string(), 2);
+        let e = left_context_entropy(&m).unwrap();
+        assert!(e > 0.0 && e < 1.0, "unbalanced distribution should give < 1.0: {}", e);
+    }
+
+    #[test]
+    fn classify_strong_def_low_entropy() {
+        assert_eq!(classify_definition(5, Some(0.5)), 2);
+    }
+
+    #[test]
+    fn classify_likely_def_medium_entropy() {
+        assert_eq!(classify_definition(5, Some(1.5)), 1);
+    }
+
+    #[test]
+    fn classify_usage_high_entropy_common() {
+        assert_eq!(classify_definition(50, Some(3.0)), 0);
+    }
+
+    #[test]
+    fn classify_default_def_for_sampled() {
+        assert_eq!(classify_definition(50, Some(1.5)), 1);
+    }
+
+    #[test]
+    fn classify_unknown_low_df_no_entropy() {
+        assert_eq!(classify_definition(5, None), -1);
+    }
+
+    #[test]
+    fn classify_high_df_no_entropy() {
+        assert_eq!(classify_definition(50, None), 0);
+    }
+
+    #[test]
+    fn classify_boundary_df_20() {
+        // Exactly at boundary
+        assert_eq!(classify_definition(20, Some(0.5)), 1);
+        assert_eq!(classify_definition(19, Some(0.5)), 2);
+    }
+
+    #[test]
+    fn classify_boundary_entropy_1_0() {
+        assert_eq!(classify_definition(15, Some(0.99)), 2);
+        assert_eq!(classify_definition(15, Some(1.01)), 1);
+    }
+}

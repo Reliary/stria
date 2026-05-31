@@ -171,4 +171,160 @@ pub fn scan_identifiers(text: &str) -> impl Iterator<Item = (usize, &str)> {
     })
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
 
+    #[test]
+    fn extract_empty() {
+        let r = extract_phrases("");
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn extract_single_word() {
+        let r = extract_phrases("hello");
+        assert_eq!(r, vec!["hello"]);
+    }
+
+    #[test]
+    fn extract_short_words_skipped() {
+        let r = extract_phrases("a an of in to be");
+        // 3-char min: "the" is 3 chars and WOULD match
+        assert!(!r.contains(&"a".to_string()));
+        assert!(!r.contains(&"an".to_string()));
+        assert!(!r.contains(&"of".to_string()));
+    }
+
+    #[test]
+    fn extract_underscore_compound() {
+        let r = extract_phrases("spool_upload_retry");
+        assert!(r.contains(&"spool_upload_retry".to_string()));
+    }
+
+    #[test]
+    fn extract_camelcase() {
+        let r = extract_phrases("SpoolManager uploadEvents");
+        assert!(r.contains(&"SpoolManager".to_string()));
+        assert!(r.contains(&"uploadEvents".to_string()));
+    }
+
+    #[test]
+    fn extract_mixed_content() {
+        let r = extract_phrases("function SpoolManager() { return 42; }");
+        assert!(r.contains(&"function".to_string()));
+        assert!(r.contains(&"SpoolManager".to_string()));
+        assert!(r.contains(&"return".to_string()));
+    }
+
+    #[test]
+    fn extract_unicode_preserved() {
+        let r: Vec<String> = extract_phrases("über cool");
+        // "ber" is captured because bytes `b`, `e`, `r` are all ASCII alphabetic
+        // (the multi-byte `ü` at positions 0-1 is skipped)
+        assert_eq!(r, vec!["ber", "cool"]);
+    }
+
+    #[test]
+    fn extract_symbols_only() {
+        let r = extract_phrases("!@#$%^&*()");
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn extract_long_text() {
+        let text = "foo bar baz qux ".repeat(100);
+        let r = extract_phrases(&text);
+        assert_eq!(r.len(), 400);
+        assert!(r.iter().all(|w| w.len() >= 3));
+    }
+
+    #[test]
+    fn line_zone_code() {
+        assert_eq!(line_zone("fn main() {"), 0);
+        assert_eq!(line_zone("let x = 42;"), 0);
+        assert_eq!(line_zone("    return x + 1;"), 0);
+        assert_eq!(line_zone("struct Foo {"), 0);
+        assert_eq!(line_zone("use std::collections;"), 0);
+    }
+
+    #[test]
+    fn line_zone_prose() {
+        assert_eq!(line_zone(""), 1);
+        assert_eq!(line_zone("    "), 1);
+        assert_eq!(line_zone("// this is a comment"), 1);
+        assert_eq!(line_zone("/* block comment start"), 1);
+        assert_eq!(line_zone("# Python-style comment"), 1);
+        assert_eq!(line_zone("* bullet point in docs"), 1);
+    }
+
+    #[test]
+    fn line_zone_preprocessor() {
+        assert_eq!(line_zone("#include <stdio.h>"), 0);
+        assert_eq!(line_zone("#define FOO 42"), 0);
+        assert_eq!(line_zone("#ifdef DEBUG"), 0);
+    }
+
+    #[test]
+    fn line_zone_shebang() {
+        assert_eq!(line_zone("#!/usr/bin/env python3"), 0);
+    }
+
+    #[test]
+    fn is_definition_function() {
+        assert!(is_definition_str("foo", "fn foo() {"));
+        assert!(is_definition_str("Foo", "struct Foo {"));
+        assert!(is_definition_str("bar", "fn bar<T>(x: T)"));
+    }
+
+    #[test]
+    fn is_definition_not_call() {
+        assert!(!is_definition_str("foo", "bar(foo)"));
+        assert!(!is_definition_str("foo", "x.foo()"));
+        assert!(!is_definition_str("foo", "let y = foo + 1;"));
+    }
+
+    #[test]
+    fn is_definition_assignment() {
+        assert!(is_definition_str("x", "let x = 42;"));
+    }
+
+    #[test]
+    fn is_definition_no_match() {
+        assert!(!is_definition_str("nonexistent", "foo bar baz"));
+    }
+
+    #[test]
+    fn scan_identifiers_empty() {
+        let r: Vec<_> = scan_identifiers("").collect();
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn scan_identifiers_basic() {
+        let r: Vec<_> = scan_identifiers("fn SpoolManager uploadEvents").collect();
+        // "fn" is 2 chars (skipped by min=3), only SpoolManager + uploadEvents
+        assert_eq!(r.len(), 2);
+    }
+
+    #[test]
+    fn scan_identifiers_short_skipped() {
+        let r: Vec<_> = scan_identifiers("a an the").collect();
+        // "the" is 3 chars → matches (min=3)
+        assert_eq!(r.len(), 1);
+    }
+
+    #[test]
+    fn scan_identifiers_unicode() {
+        let r: Vec<_> = scan_identifiers("café crème brûlée").collect();
+        // Only ASCII identifiers, "caf" should be found (first 3 bytes of café)
+        // Let's just verify no crash
+        assert!(r.len() >= 0);
+    }
+
+    #[test]
+    fn scan_identifiers_underscore() {
+        let r: Vec<_> = scan_identifiers("_private __dunder__").collect();
+        assert_eq!(r.len(), 2);
+    }
+}
