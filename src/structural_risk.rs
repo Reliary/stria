@@ -255,6 +255,68 @@ pub fn build_file_index(db_path: &str) -> Vec<String> {
     files
 }
 
+/// Find fixture definitions (Dark Matter): capitalized identifiers used in the
+/// test file that are defined in a different non-source file (mock, helper, fixture).
+/// Returns (identifier_name, definition_file_path) pairs.
+pub fn find_fixtures(db_path: &str, source_file: &str, test_file: &str) -> Vec<(String, String)> {
+    let db = match Connection::open(db_path) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("eh:error: find_fixtures: db open failed: {}", e);
+            return vec![];
+        }
+    };
+
+    let src_fid: i64 = match db.query_row("SELECT id FROM file_map WHERE file_path=?1", [source_file], |r| r.get(0)) {
+        Ok(id) => id,
+        Err(_) => return vec![],
+    };
+    let test_fid: i64 = match db.query_row("SELECT id FROM file_map WHERE file_path=?1", [test_file], |r| r.get(0)) {
+        Ok(id) => id,
+        Err(_) => return vec![],
+    };
+
+    // Find capitalized identifiers used in the test file that are defined
+    // with is_def=1 in a third file (not source, not test).
+    // Filters to code source/test files only using mechanical path rules.
+    let mut results: Vec<(String, String)> = Vec::new();
+    if let Ok(mut stmt) = db.prepare(
+        "SELECT p.phrase, fm_def.file_path
+         FROM phrase_occ po_test
+         JOIN phrases p ON p.id = po_test.phrase_id
+         JOIN phrase_occ po_def ON po_def.phrase_id = po_test.phrase_id
+             AND po_def.file_id NOT IN (?1, ?2)
+         JOIN file_map fm_def ON fm_def.id = po_def.file_id
+         WHERE po_test.file_id = ?1
+           AND (po_def.flags & 1) = 1
+           AND p.phrase GLOB '[A-Z]*'
+           AND LENGTH(p.phrase) > 3
+         GROUP BY p.phrase
+         LIMIT 20"
+    ) {
+        if let Ok(rows) = stmt.query_map(rusqlite::params![test_fid, src_fid], |r| {
+            let phrase = r.get::<_, String>(0)?;
+            let fp = r.get::<_, String>(1)?;
+            Ok((phrase, fp))
+        }) {
+            for row in rows.flatten() {
+                let (phrase, fp) = row;
+                // Mechanical path filter: skip docs, artifacts, lockfiles, configs
+                let skip = fp.ends_with(".md") || fp.ends_with(".json") || fp.ends_with(".yml")
+                    || fp.ends_with(".yaml") || fp.ends_with(".toml") || fp.ends_with(".txt")
+                    || fp.ends_with(".html") || fp.ends_with(".css")
+                    || fp.starts_with("artifacts/") || fp.starts_with("node_modules/")
+                    || fp.contains("web/templates") || fp.contains("BACKLOG") || fp.contains("CRITICAL");
+                if !skip {
+                    results.push((phrase, fp));
+                }
+            }
+        }
+    }
+
+    results
+}
+
 /// Find verification candidates: test files related to a target source file
 pub fn find_verify_candidates(db_path: &str, file: &str) -> Vec<(String, f64)> {
     let (db, fid) = match open_db_and_file(db_path, file) {
@@ -362,9 +424,22 @@ pub fn hologram_plan(
 
     db.close().ok();
 
+    // Dark Matter Mapper: find fixture definitions for the top verify candidate
+    let fixtures: Vec<serde_json::Value> = if let Some(edit_file) = scored.first().map(|(fp, _)| fp.clone()) {
+        verify_candidates.iter().take(2).flat_map(|test_file| {
+            find_fixtures(db_path, &edit_file, test_file)
+                .into_iter()
+                .map(|(phrase, fp)| serde_json::json!({"phrase": phrase, "file": fp}))
+                .collect::<Vec<_>>()
+        }).collect()
+    } else {
+        vec![]
+    };
+
     serde_json::json!({
         "edit": scored.first().map(|(fp, _)| fp),
         "verify": verify_candidates,
+        "fixtures": fixtures,
         "read_first": read_files,
         "coupled": coupled,
         "risk": risk,

@@ -90,15 +90,15 @@ fn mcp_server(repo_path: &str) {
     let mut initialized = false;
 
     let tools = json!([
-        {"name": "hologram_orient", "description": "One-time session orientation. Returns tool workflow map + language breakdown. Call this first. ~80t.", "inputSchema": {"type": "object", "properties": {}, "required": []}},
-        {"name": "hologram_task", "description": "Single composite tool for all code-search needs. Three expansion tiers: default (compact paths, ~80t), expand_plan (+read_order/risk, ~150t), expand_full (+who_calls/latent_deps, ~250t). Use when: editing code, finding test files, checking impact.", "inputSchema": {"type": "object", "properties": {"task": {"type": "string"}, "expand_plan": {"type": "boolean"}, "expand_full": {"type": "boolean"}}, "required": ["task"]}},
-        {"name": "holo_search", "description": "Find files by conceptual content (not filename). Use when: you know what the code does but not where it lives. Input: free-form query of 1-5 keywords. Returns: top 10 files with relevance scores.", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}},
-        {"name": "hologram_plan", "description": "Full execution plan with read_order, edit target, verify candidates, coupled files, risk level. Use when: you need detailed pre-edit guidance beyond what hologram_task default tier provides.", "inputSchema": {"type": "object", "properties": {"task": {"type": "string"}}, "required": ["task"]}},
+        {"name": "orient", "description": "One-time session orientation. Returns tool workflow map + language breakdown. Call this first. ~80t.", "inputSchema": {"type": "object", "properties": {}, "required": []}},
+        {"name": "code_search", "description": "Single composite tool for all code-search needs. Three expansion tiers: default (compact paths, ~80t), expand_plan (+read_order/risk, ~150t), expand_full (+who_calls/hidden_deps, ~250t). Use when: editing code, finding test files, checking impact.", "inputSchema": {"type": "object", "properties": {"task": {"type": "string"}, "expand_plan": {"type": "boolean"}, "expand_full": {"type": "boolean"}}, "required": ["task"]}},
+        {"name": "search", "description": "Find files by conceptual content (not filename). Use when: you know what the code does but not where it lives. Input: free-form query of 1-5 keywords. Returns: top 10 files with relevance scores.", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}},
+        {"name": "pre_edit", "description": "Full execution plan with read_order, edit target, verify candidates, fixtures, coupled files, risk level. Use when: you need detailed pre-edit guidance beyond what code_search default tier provides.", "inputSchema": {"type": "object", "properties": {"task": {"type": "string"}}, "required": ["task"]}},
         {"name": "who_calls", "description": "Find all files that reference a specific identifier. Use when: refactoring a function and need to check callers. Input: exact identifier name (case-sensitive).", "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}},
-        {"name": "latent_deps", "description": "Find hidden cross-module dependencies that imports don't reveal. Use when: checking if a refactor reaches outside the current module. Input: file path relative to repo root.", "inputSchema": {"type": "object", "properties": {"file": {"type": "string"}}, "required": ["file"]}},
-        {"name": "cross_horizon", "description": "Expand a [HORIZON: hash] marker to full function body. Use when: orient output shows an horizon marker and you need to read the function source. Input: the hex hash from the marker.", "inputSchema": {"type": "object", "properties": {"hash": {"type": "string"}}, "required": ["hash"]}},
-        {"name": "search_horizon", "description": "Find horizon hashes by function name. Use when: you know a function name and need its hash for cross_horizon. Input: function name or partial name.", "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}},
-        {"name": "eh_health", "description": "Server health check. Returns DB stats and latency. Use when: connection issues or monitoring.", "inputSchema": {"type": "object", "properties": {}, "required": []}},
+        {"name": "hidden_deps", "description": "Find hidden cross-module dependencies that imports don't reveal. Use when: checking if a refactor reaches outside the current module. Input: file path relative to repo root.", "inputSchema": {"type": "object", "properties": {"file": {"type": "string"}}, "required": ["file"]}},
+        {"name": "expand_body", "description": "Expand a [HORIZON: hash] marker to full function body. Use when: orient output shows an horizon marker and you need to read the function source. Input: the hex hash from the marker.", "inputSchema": {"type": "object", "properties": {"hash": {"type": "string"}}, "required": ["hash"]}},
+        {"name": "find_hash", "description": "Find horizon hashes by function name. Use when: you know a function name and need its hash for expand_body. Input: function name or partial name.", "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}},
+        {"name": "health", "description": "Server health check. Returns DB stats and latency. Use when: connection issues or monitoring.", "inputSchema": {"type": "object", "properties": {}, "required": []}},
     ]);
 
     for line in io::stdin().lock().lines() {
@@ -133,7 +133,7 @@ fn mcp_server(repo_path: &str) {
             "tools/call" => {
                 let name = request.pointer("/params/name").and_then(|n| n.as_str()).unwrap_or("");
                 let result = match name {
-                    "hologram_orient" => {
+                    "orient" => {
                         let n_files: i64 = if let Ok(db) = rusqlite::Connection::open(&db_path) {
                             db.query_row("SELECT COUNT(*) FROM file_map", [], |r| r.get(0)).unwrap_or(0)
                         } else { 0 };
@@ -165,22 +165,22 @@ fn mcp_server(repo_path: &str) {
                             "n_files": n_files,
                             "languages": languages,
                             "workflows": {
-                                "pre_edit": {"tools": ["hologram_task(task=...) -> default tier", "who_calls(name=...) -> if refactoring", "latent_deps(file=...) -> if cross-module"], "description": "Use hologram_task first. who_calls/latent_deps for targeted questions."},
-                                "discovery": {"tools": ["holo_search(query=...)"], "description": "Find files when you know the concept but not the location."},
-                                "impact": {"tools": ["who_calls(name=...)", "latent_deps(file=...)"], "description": "Check callers and hidden dependencies."}
+                                "pre_edit": {"tools": ["code_search(task=...) -> default tier", "who_calls(name=...) -> if refactoring", "hidden_deps(file=...) -> if cross-module"], "description": "Use code_search first. who_calls/hidden_deps for targeted questions."},
+                                "discovery": {"tools": ["search(query=...)"], "description": "Find files when you know the concept but not the location."},
+                                "impact": {"tools": ["who_calls(name=...)", "hidden_deps(file=...)"], "description": "Check callers and hidden dependencies."}
                             },
                             "tool_guide": {
-                                "hologram_task": {"use_when": "editing code and need target files + test candidates", "expand_plan": "adds read_order and blast radius", "expand_full": "adds who_calls chains and latent deps"},
-                                "holo_search": {"use_when": "need to find files by concept (not filename)"},
-                                "hologram_plan": {"use_when": "need full plan beyond hologram_task default"},
+                                "code_search": {"use_when": "editing code and need target files + test candidates", "expand_plan": "adds read_order and blast radius", "expand_full": "adds who_calls chains and hidden deps"},
+                                "search": {"use_when": "need to find files by concept (not filename)"},
+                                "pre_edit": {"use_when": "need full plan beyond code_search default"},
                                 "who_calls": {"use_when": "refactoring a specific function/type and need to check callers"},
-                                "latent_deps": {"use_when": "need hidden cross-module coupling"},
-                                "cross_horizon": {"use_when": "a [HORIZON: hash] marker appears and you need the function body"},
-                                "search_horizon": {"use_when": "you know a function name and need its hash"}
+                                "hidden_deps": {"use_when": "need hidden cross-module coupling"},
+                                "expand_body": {"use_when": "a [HORIZON: hash] marker appears and you need the function body"},
+                                "find_hash": {"use_when": "you know a function name and need its hash"}
                             }
                         })
                     }
-                    "hologram_task" => {
+                    "code_search" => {
                         let task = request.pointer("/params/arguments/task")
                             .and_then(|t| t.as_str()).unwrap_or("");
                         let expand_plan = request.pointer("/params/arguments/expand_plan")
@@ -222,6 +222,8 @@ fn mcp_server(repo_path: &str) {
                             let response_obj = response.as_object_mut().unwrap();
                             response_obj.insert("read_order".to_string(), json!(read_order));
                             response_obj.insert("coupled".to_string(), json!(coupled));
+                            let fixtures = plan.get("fixtures").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+                            response_obj.insert("fixtures".to_string(), json!(fixtures));
                         }
 
                         // Tier 3: expand_full — add caller chains and latent deps
@@ -243,19 +245,19 @@ fn mcp_server(repo_path: &str) {
                             if let Some((top_fp, _)) = search_results.first() {
                                 let deps = structural_risk::latent_deps(&db_path, top_fp);
                                 let dep_paths: Vec<Value> = deps.iter().take(5).map(|(fp, _)| json!(fp)).collect();
-                                response_obj.insert("latent_deps".to_string(), json!(dep_paths));
+                                response_obj.insert("hidden_deps".to_string(), json!(dep_paths));
                             }
                         }
 
                         response
                     }
-                    "cross_horizon" => {
+                    "expand_body" => {
                         let hash = request.pointer("/params/arguments/hash")
                             .and_then(|h| h.as_str()).unwrap_or("");
                         let body = get_horizon_body(repo_path, hash);
                         json!({"body": body})
                     }
-                    "search_horizon" => {
+                    "find_hash" => {
                         let search_name = request.pointer("/params/arguments/name")
                             .and_then(|n| n.as_str()).unwrap_or("");
                         let results = if let Ok(c) = rusqlite::Connection::open(
@@ -271,7 +273,7 @@ fn mcp_server(repo_path: &str) {
                         } else { vec![] };
                         json!({"results": results})
                     }
-                    "holo_search" => {
+                    "search" => {
                         let query = request.pointer("/params/arguments/query")
                             .and_then(|q| q.as_str()).unwrap_or("");
                         let results = search::search_phrases(&db_path, query, 10);
@@ -280,7 +282,7 @@ fn mcp_server(repo_path: &str) {
                         }).collect();
                         json!({"candidates": files})
                     }
-                    "hologram_plan" => {
+                    "pre_edit" => {
                         let task = request.pointer("/params/arguments/task")
                             .and_then(|t| t.as_str()).unwrap_or("");
                         let plan = structural_risk::hologram_plan(&db_path, task);
@@ -292,13 +294,13 @@ fn mcp_server(repo_path: &str) {
                         let results = structural_risk::who_calls(&db_path, call_name);
                         json!({"callers": results})
                     }
-                    "latent_deps" => {
+                    "hidden_deps" => {
                         let file = request.pointer("/params/arguments/file")
                             .and_then(|f| f.as_str()).unwrap_or("");
                         let results = structural_risk::latent_deps(&db_path, file);
                         json!({"deps": results})
                     }
-                    "eh_health" => {
+                    "health" => {
                         let t0 = std::time::Instant::now();
                         let mut n_phrases = 0i64;
                         let mut n_files = 0i64;
