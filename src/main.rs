@@ -39,6 +39,11 @@ enum Commands {
         #[arg(long)]
         repo: String,
     },
+    /// Watch repo for changes and rebuild index incrementally
+    Watch {
+        #[arg(long)]
+        repo: String,
+    },
 }
 
 fn main() {
@@ -81,6 +86,24 @@ fn main() {
             }
             eprintln!("Event Horizon MCP server starting for repo: {}", canonical.display());
             mcp_server(canonical.to_str().unwrap_or(&repo));
+        }
+        Commands::Watch { repo } => {
+            let repo_path = Path::new(&repo);
+            let canonical = repo_path.canonicalize().unwrap_or_else(|_| repo_path.to_path_buf());
+            let out_dir = canonical.join(".horizon");
+            if !out_dir.join("phrases.sqlite").exists() {
+                match index::build_phrase_index(canonical.to_str().unwrap_or(&repo), &out_dir, false) {
+                    Ok(n) => eprintln!("Index built: {} phrases", n),
+                    Err(e) => {
+                        eprintln!("Index build failed: {}", e);
+                        return;
+                    }
+                }
+            }
+            eprintln!("Watching repo for changes: {}", canonical.display());
+            if let Err(e) = index::watch_changes(canonical.to_str().unwrap_or(&repo), &out_dir) {
+                eprintln!("Watch error: {}", e);
+            }
         }
     }
 }

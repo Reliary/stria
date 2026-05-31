@@ -628,3 +628,21 @@ fn sha256_file(path: &Path) -> Result<String, io::Error> {
     let result = hasher.finalize();
     Ok(format!("{:x}", result))
 }
+
+/// Watch a repo for file changes and trigger rebuilds.
+/// Cross-platform: uses polling every 2 seconds.
+/// The digest cache inside build_phrase_index handles incremental extraction,
+/// so unchanged files cost ~0.02s per poll.
+pub fn watch_changes(repo: &str, out_dir: &Path) -> Result<(), String> {
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        match build_phrase_index(repo, out_dir, false) {
+            Ok(n) => {
+                if n > 0 {
+                    eprintln!("eh:info: index updated: {} phrases", n);
+                }
+            }
+            Err(e) => eprintln!("eh:warn: rebuild error: {}", e),
+        }
+    }
+}
