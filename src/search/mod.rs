@@ -12,7 +12,7 @@ pub mod proximity;
 /// Path-role multiplier: /src/ = 2.0, tests = 0.6, deps/vendor = 0.3
 fn path_role_mult(file_path: &str) -> f64 {
     if file_path.contains("/src/") || file_path.starts_with("src/") { return 2.0; }
-    if file_path.contains("/test") || file_path.contains("/spec") || 
+    if file_path.contains("/test") || file_path.contains("/spec") ||
        file_path.starts_with("test") || file_path.starts_with("spec") { return 0.6; }
     if file_path.contains("/deps/") || file_path.contains("/vendor/") ||
        file_path.starts_with("vendor/") || file_path.starts_with("deps/") { return 0.3; }
@@ -37,7 +37,6 @@ fn unpack_first_line(blob: &[u8]) -> Option<i32> {
 }
 
 /// Proximity bonus from first_line entries.
-/// Multiplicative: if matched terms cluster within 10 lines, 1.0-1.5x boost.
 fn proximity_mult(line_sets: &[Vec<i32>], max_gap: i32) -> f64 {
     if line_sets.len() < 2 { return 1.0; }
     let mut min_dist = i32::MAX;
@@ -106,18 +105,20 @@ pub fn search_phrases(
         }
     }
 
-    // Pre-compute IDF
+    // Pre-compute IDF — all queries go through phrases table JOIN
     let mut idf_map: HashMap<String, f64> = HashMap::new();
     for st in &search_terms {
         let df: f64 = db.query_row(
-            "SELECT COUNT(*) FROM phrase_occ WHERE phrase = ?1", [st], |r| r.get(0)
+            "SELECT COUNT(*) FROM phrase_occ po
+             JOIN phrases p ON p.id = po.phrase_id
+             WHERE p.phrase = ?1", [st], |r| r.get(0)
         ).unwrap_or(1.0);
         idf_map.insert(st.clone(), bm25::bm25_idf(n_docs, df.max(0.5)));
     }
 
     let mut file_scores: HashMap<i64, f64> = HashMap::new();
     let mut file_line_sets: HashMap<i64, HashMap<String, Vec<i32>>> = HashMap::new();
-    let mut file_tiers: HashMap<i64, u8> = HashMap::new(); // 0=exact, 1=prefix, 2=substr
+    let mut file_tiers: HashMap<i64, u8> = HashMap::new();
     let mut file_phrases_matched: HashMap<i64, u32> = HashMap::new();
 
     // Tier 1: Exact match BM25
@@ -127,8 +128,10 @@ pub fn search_phrases(
             "SELECT po.file_id, po.count, po.is_def, po.zone_int, fs.token_len,
                     fs.unique_def_count, fs.total_def_count, fs.comment_ratio,
                     po.line_nos
-             FROM phrase_occ po JOIN file_stats fs ON fs.file_id = po.file_id
-             WHERE po.phrase = ?1"
+             FROM phrase_occ po
+             JOIN phrases p ON p.id = po.phrase_id
+             JOIN file_stats fs ON fs.file_id = po.file_id
+             WHERE p.phrase = ?1"
         ) {
             Ok(q) => q,
             Err(_) => continue,
@@ -154,19 +157,14 @@ pub fn search_phrases(
             let uniq_mult = if total_def > 0 && uniq_def > 0 {
                 1.0 + (uniq_def as f64 / total_def as f64) * 0.5
             } else { 1.0 };
-            // Comment penalty: high comment ratio reduces score
             let comment_mult = (1.0 - comment_ratio * 0.5).max(0.5);
             *file_scores.entry(fid).or_insert(0.0) += score * zone_mult * def_mult * uniq_mult * comment_mult;
             file_tiers.entry(fid).or_insert(0);
             *file_phrases_matched.entry(fid).or_insert(0) += 1;
-            if let Some(ln) = line_nos.first() {
-                let line = *ln as i32; // first byte is sufficient for first_line since first_line ≤ 255 for small files... no.
-                // Actually unpack the 4-byte LE
-                if let Some(first_line) = unpack_first_line(&line_nos) {
-                    file_line_sets.entry(fid).or_default()
-                        .entry(st.clone()).or_default()
-                        .push(first_line);
-                }
+            if let Some(first_line) = unpack_first_line(&line_nos) {
+                file_line_sets.entry(fid).or_default()
+                    .entry(st.clone()).or_default()
+                    .push(first_line);
             }
         }
     }
@@ -180,8 +178,10 @@ pub fn search_phrases(
         let mut prefix_q = match db.prepare(
             "SELECT po.file_id, po.is_def, po.zone_int, fs.token_len,
                     fs.unique_def_count, fs.total_def_count, fs.comment_ratio
-             FROM phrase_occ po JOIN file_stats fs ON fs.file_id = po.file_id
-             WHERE po.phrase LIKE ?1 AND po.phrase != ?2"
+             FROM phrase_occ po
+             JOIN phrases p ON p.id = po.phrase_id
+             JOIN file_stats fs ON fs.file_id = po.file_id
+             WHERE p.phrase LIKE ?1 AND p.phrase != ?2"
         ) {
             Ok(q) => q,
             Err(_) => continue,
@@ -225,8 +225,10 @@ pub fn search_phrases(
         let mut sub_q = match db.prepare(
             "SELECT po.file_id, po.count, po.is_def, po.zone_int, fs.token_len,
                     fs.comment_ratio
-             FROM phrase_occ po JOIN file_stats fs ON fs.file_id = po.file_id
-             WHERE po.phrase LIKE ?1 AND po.phrase NOT LIKE ?2 AND po.phrase != ?3
+             FROM phrase_occ po
+             JOIN phrases p ON p.id = po.phrase_id
+             JOIN file_stats fs ON fs.file_id = po.file_id
+             WHERE p.phrase LIKE ?1 AND p.phrase NOT LIKE ?2 AND p.phrase != ?3
              LIMIT 200"
         ) {
             Ok(q) => q,
@@ -255,7 +257,7 @@ pub fn search_phrases(
         }
     }
 
-    // Phase 4: Concentration bonus — files matching more distinct query terms get boost
+    // Concentration bonus
     let total_search_terms = search_terms.len() as f64;
     if total_search_terms > 1.0 {
         for (fid, score) in file_scores.iter_mut() {
@@ -269,7 +271,7 @@ pub fn search_phrases(
     let mut scored: Vec<(i64, f64)> = file_scores.into_iter().collect();
     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-    // Collect top candidates for final scoring with path-role, filename boost, proximity, module bonus
+    // Collect top candidates
     let candidate_count = (top_n * 5).min(scored.len());
     let top_fids: Vec<i64> = scored.iter().take(candidate_count).map(|(fid, _)| *fid).collect();
 
@@ -289,7 +291,7 @@ pub fn search_phrases(
         }
     }
 
-    // Compute module cluster bonus
+    // Module cluster bonus
     let mut module_scores: HashMap<String, f64> = HashMap::new();
     for (fid, base_score) in &scored[..candidate_count.min(20)] {
         if let Some(fp) = fp_map.get(fid) {
@@ -300,39 +302,27 @@ pub fn search_phrases(
 
     // Apply all multipliers
     let mut results: Vec<(String, f64)> = Vec::new();
-    let mut top_fps: Vec<String> = Vec::new();
     for (fid, base_score) in &scored[..candidate_count] {
         if let Some(fp) = fp_map.get(fid) {
             let mut final_score = *base_score;
-
-            // Path-role multiplier
             final_score *= path_role_mult(fp);
-
-            // Filename boost
             final_score *= filename_boost(fp, &search_terms);
-
-            // Module cluster bonus: +10% if file's module is a top module
             let mod_path = file_module(fp);
             if let Some(mod_score) = module_scores.get(&mod_path) {
                 if *mod_score > 0.0 {
                     final_score *= 1.0 + (mod_score / n_docs).min(0.1);
                 }
             }
-
-            // Proximity bonus: across matched terms
             if let Some(line_sets) = file_line_sets.get(fid) {
                 let lines: Vec<Vec<i32>> = line_sets.values().cloned().collect();
                 if !lines.is_empty() {
                     final_score *= proximity_mult(&lines, 10);
                 }
             }
-
-            top_fps.push(fp.clone());
             results.push((fp.clone(), final_score));
         }
     }
 
-    // Re-sort with all multipliers
     results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     results.truncate(top_n);
 

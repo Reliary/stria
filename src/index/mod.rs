@@ -14,7 +14,6 @@ use fxhash::{FxHashMap, FxHasher};
 use crate::zone;
 
 /// Fast hash of a phrase string to u64. Collision risk for 85K phrases: ~1 in 2^32.
-/// This eliminates String allocations in the 200K-entry occs accumulator.
 fn phrase_hash(s: &str) -> u64 {
     let mut h = FxHasher::default();
     s.hash(&mut h);
@@ -64,7 +63,6 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
     let mut all_digests: HashMap<String, String> = HashMap::new();
 
     if digest_cache.is_empty() {
-        // First build — every file is changed, skip expensive SHA-256 per file
         for rel in &files {
             all_digests.insert(rel.clone(), String::new());
             changed_files.push((rel.clone(), String::new()));
@@ -99,14 +97,13 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
 
     let is_full_rebuild = changed_files.len() as f64 >= files.len() as f64 * 0.3 || !db_path.exists() || digest_cache.is_empty();
 
-    // Sequential or parallel extraction
     let source_files: Vec<String> = if is_full_rebuild {
         files.clone()
     } else {
         changed_files.iter().map(|(rel, _)| rel.clone()).collect()
     };
 
-    // Accumulators — plain maps, merged from WorkerResult after parallel extraction
+    // Accumulators
     let mut occs: FxHashMap<(u64, i64), OccEntry> = FxHashMap::default();
     let mut phrase_strings: HashMap<u64, String> = HashMap::new();
     let mut phrase_left_ctx: HashMap<String, HashMap<String, u32>> = HashMap::new();
@@ -116,15 +113,16 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
     let mut file_comment_ratios: HashMap<i64, f64> = HashMap::new();
     let mut global_total_phrases: u32 = 0;
 
-    // Build file_map for new files
+    // Build file_map
     let mut file_map: Vec<(i64, String)> = Vec::new();
     if is_full_rebuild {
         if let Ok(_) = db.execute("DELETE FROM file_map", []) {}
+        if let Ok(_) = db.execute("DELETE FROM phrases", []) {}
+        if let Ok(_) = db.execute("DELETE FROM phrase_occ", []) {}
         for (i, rel) in files.iter().enumerate() {
             file_map.push(((i + 1) as i64, rel.clone()));
         }
     } else {
-        // Load existing IDs, add new
         let mut existing: HashMap<String, i64> = HashMap::new();
         if let Ok(mut get_files_q) = db.prepare("SELECT id, file_path FROM file_map") {
             if let Ok(rows) = get_files_q.query_map([], |r| {
@@ -135,7 +133,6 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
                 }
             }
         }
-        // Get max ID
         let max_id: i64 = db.query_row("SELECT COALESCE(MAX(id), 0) FROM file_map", [], |r| r.get(0)).unwrap_or(0);
         let mut next_id = max_id + 1;
         for rel in &files {
@@ -146,7 +143,6 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
                 next_id += 1;
             }
         }
-        // Remove old entries for changed files
         for (rel, _) in &changed_files {
             if let Some(fid) = existing.get(rel) {
                 if let Ok(_) = db.execute("DELETE FROM phrase_occ WHERE file_id = ?1", [fid]) {}
@@ -168,18 +164,10 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
     }
     fs::write("/tmp/eh_progress.txt", "file_map done\n").ok();
 
-    // Determine which files to extract
-    let extract_set: HashSet<&str> = if is_full_rebuild {
-        files.iter().map(|s| s.as_str()).collect()
-    } else {
-        changed_files.iter().map(|(rel, _)| rel.as_str()).collect()
-    };
-
-    // Parallel extraction — single pass over ALL source files.
-    // Rayon handles work-stealing across all available cores.
+    // Parallel extraction
     let n_files = source_files.len();
     let chunk_size = (n_files / rayon::current_num_threads().max(1)).max(1);
-    fs::write("/tmp/eh_progress.txt", format!("extraction: {} files, {} chunks, {} threads\n", n_files, (n_files + chunk_size - 1) / chunk_size, rayon::current_num_threads())).ok();
+    fs::write("/tmp/eh_progress.txt", format!("extraction: {} files, {} threads\n", n_files, rayon::current_num_threads())).ok();
 
     let repo_arc = std::sync::Arc::new(repo);
     let file_map_arc = std::sync::Arc::new(file_map.clone());
@@ -199,7 +187,6 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
             let mut local_fcl: HashMap<i64, usize> = HashMap::new();
             let mut local_fcr: HashMap<i64, f64> = HashMap::new();
             let mut local_total = 0u32;
-            // Phase 3: skip LCEP for large repos (>5000 files) — marginal accuracy gain, high cost
             let track_lcep = n_files <= 5000;
 
             for rel in chunk {
@@ -207,10 +194,6 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
                 let text = match fs::read_to_string(&fpath) {
                     Ok(t) => t,
                     Err(_) => continue,
-                };
-                let fid = match file_id_map.get(rel.as_str()) {
-                    Some(id) => *id,
-                    None => continue,
                 };
                 let fid = match file_id_map.get(rel.as_str()) {
                     Some(id) => *id,
@@ -282,34 +265,49 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
             })
         }).collect();
 
-    fs::write("/tmp/eh_progress.txt", format!("extraction done: {} worker results, {} occs\n", results.len(), results.iter().map(|r| r.occs.len()).sum::<usize>())).ok();
+    fs::write("/tmp/eh_progress.txt", format!("extraction done: {} worker results\n", results.len())).ok();
 
-    // Merge all results into global accumulators
+    // Merge all results
     for wr in results {
-        for (k, v) in wr.occs {
-            occs.entry(k).or_insert(v);
-        }
+        for (k, v) in wr.occs { occs.entry(k).or_insert(v); }
         for (k, v) in wr.left_ctx {
             let entry = phrase_left_ctx.entry(k).or_default();
-            for (ck, cv) in v {
-                *entry.entry(ck).or_insert(0) += cv;
-            }
+            for (ck, cv) in v { *entry.entry(ck).or_insert(0) += cv; }
         }
-        for (k, v) in wr.phrase_df {
-            *phrase_df_counter.entry(k).or_insert(0) += v;
-        }
-        for (k, v) in wr.phrase_strings {
-            phrase_strings.entry(k).or_insert(v);
-        }
+        for (k, v) in wr.phrase_df { *phrase_df_counter.entry(k).or_insert(0) += v; }
+        for (k, v) in wr.phrase_strings { phrase_strings.entry(k).or_insert(v); }
         file_token_lens.extend(wr.token_lens);
         file_content_lens.extend(wr.content_lens);
         file_comment_ratios.extend(wr.comment_ratios);
         global_total_phrases += wr.total_phrases;
     }
 
-    fs::write("/tmp/eh_progress.txt", format!("merge done: {} occs, sorting for WITHOUT ROWID...\n", occs.len())).ok();
+    fs::write("/tmp/eh_progress.txt", format!("merge done: {} occs, building phrase table...\n", occs.len())).ok();
 
-    // Pre-compute LCEP thresholds for is_def overrides
+    // Build phrase table: assign integer IDs to unique phrases
+    // Sort by phrase string for deterministic output
+    let mut phrase_list: Vec<(u64, String)> = phrase_strings.into_iter().collect();
+    phrase_list.sort_by(|a, b| a.1.cmp(&b.1));
+
+    // phrase_hash → phrase_id mapping (1-based)
+    let mut phrase_to_id: HashMap<u64, i64> = HashMap::with_capacity(phrase_list.len());
+    {
+        let tx = db.unchecked_transaction().map_err(|e| format!("tx phrases: {}", e))?;
+        {
+            let mut stmt = tx.prepare("INSERT OR IGNORE INTO phrases (id, phrase) VALUES (?1, ?2)")
+                .map_err(|e| format!("prepare phrases: {}", e))?;
+            for (idx, (ph, phrase)) in phrase_list.iter().enumerate() {
+                let pid = (idx + 1) as i64;
+                stmt.execute(params![pid, phrase]).map_err(|e| format!("insert phrase: {}", e))?;
+                phrase_to_id.insert(*ph, pid);
+            }
+            drop(stmt);
+        }
+        tx.commit().map_err(|e| format!("commit phrases: {}", e))?;
+    }
+    fs::write("/tmp/eh_progress.txt", format!("phrase table: {} unique phrases\n", phrase_list.len())).ok();
+
+    // LCEP thresholds (for small repos only)
     let lcep_thresholds: HashMap<u64, f64> = phrase_left_ctx.iter()
         .filter_map(|(pl, ctx_counts)| {
             let total: u32 = ctx_counts.values().sum();
@@ -321,31 +319,28 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
             Some((ph, entropy))
         }).collect();
 
-    // Sort by (phrase_string, file_id) for sequential WITHOUT ROWID B-tree fill.
-    // Without ROWID: sorted inserts fill pages sequentially (zero page splits).
-    // Unsorted inserts cause random page access → 10x slower.
+    // Sort occs by (phrase_id, file_id) for sequential WITHOUT ROWID B-tree fill.
+    // Phrase_id is an integer — sort is pure arithmetic, no string comparison needed.
     let mut sorted: Vec<((u64, i64), OccEntry)> = occs.into_iter().collect();
     sorted.par_sort_unstable_by(|a, b| {
-        let pa = phrase_strings.get(&a.0 .0).map(|s| s.as_str()).unwrap_or("");
-        let pb = phrase_strings.get(&b.0 .0).map(|s| s.as_str()).unwrap_or("");
-        pa.cmp(pb).then_with(|| a.0 .1.cmp(&b.0 .1))
+        let pa = phrase_to_id.get(&a.0 .0).copied().unwrap_or(i64::MAX);
+        let pb = phrase_to_id.get(&b.0 .0).copied().unwrap_or(i64::MAX);
+        pa.cmp(&pb).then_with(|| a.0 .1.cmp(&b.0 .1))
     });
-    fs::write("/tmp/eh_progress.txt", format!("sorted {} entries, inserting...\n", sorted.len())).ok();
+    fs::write("/tmp/eh_progress.txt", format!("sorted {} entries, inserting phrase_occ...\n", sorted.len())).ok();
 
-    // Bulk INSERT in sorted order — single transaction, zero page splits
+    // Bulk INSERT phrase_occ with integer phrase_id
     {
         let tx = db.unchecked_transaction().map_err(|e| format!("tx: {}", e))?;
         {
             let mut stmt = tx.prepare(
-                "INSERT INTO phrase_occ (phrase, file_id, is_def, zone, count, line_nos, zone_int)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
+                "INSERT INTO phrase_occ (phrase_id, file_id, is_def, zone_int, count, line_nos)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
             ).map_err(|e| format!("prepare: {}", e))?;
 
             let mut row_count = 0u32;
             for ((ph, fid), [is_def_orig, zone_code, count, first_line]) in &sorted {
-                let phrase = phrase_strings.get(ph)
-                    .map(|s| s.as_str())
-                    .unwrap_or("__missing__");
+                let pid = phrase_to_id.get(ph).copied().unwrap_or(0);
                 let mut is_def = *is_def_orig;
                 let df = phrase_df_counter.get(ph).copied().unwrap_or(0);
 
@@ -358,10 +353,9 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
                     if is_def == 0 && !lcep_thresholds.contains_key(ph) && df < 10 { is_def = -1; }
                 }
 
-                let zone_str = if *zone_code == 0 { "code" } else { "prose" };
-                let zi = if *zone_code == 0 { 0i32 } else { 1i32 };
+                let zi = *zone_code;
                 let line_blob = first_line.to_le_bytes().to_vec();
-                stmt.execute(rusqlite::params![phrase, fid, is_def, zone_str, count, line_blob, zi])
+                stmt.execute(rusqlite::params![pid, fid, is_def, zi, count, line_blob])
                     .map_err(|e| format!("insert: {}", e))?;
 
                 row_count += 1;
@@ -373,7 +367,7 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
         }
         tx.commit().map_err(|e| format!("commit: {}", e))?;
     }
-    fs::write("/tmp/eh_progress.txt", "SQLite commit done, stats...\n").ok();
+    fs::write("/tmp/eh_progress.txt", "phrase_occ done, stats...\n").ok();
 
     // File stats
     {
@@ -390,15 +384,13 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
         }
         drop(stats_stmt);
 
-        // Uniqueness ratio — only for repos under 2M phrase_occ rows
-        // For large repos, this query is too expensive on first build
         let occ_count: i64 = db.query_row("SELECT COUNT(*) FROM phrase_occ", [], |r| r.get(0)).unwrap_or(0);
         if occ_count < 2_000_000 {
             db.execute_batch(
-                "CREATE TEMP TABLE phrase_df AS SELECT phrase, COUNT(*) AS df FROM phrase_occ GROUP BY phrase;
+                "CREATE TEMP TABLE phrase_df AS SELECT phrase_id, COUNT(*) AS df FROM phrase_occ GROUP BY phrase_id;
                  UPDATE file_stats SET unique_def_count = (
                      SELECT COUNT(*) FROM phrase_occ po
-                     JOIN phrase_df ON phrase_df.phrase = po.phrase
+                     JOIN phrase_df ON phrase_df.phrase_id = po.phrase_id
                      WHERE po.file_id = file_stats.file_id AND po.is_def = 1 AND phrase_df.df = 1
                  );
                  UPDATE file_stats SET total_def_count = (
@@ -428,7 +420,7 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
     let _ = db.close();
 
     if verbose {
-        eprintln!("Phrase index built: {} files, {} phrases", files.len(), sorted.len());
+        eprintln!("Phrase index built: {} files, {} phrases", files.len(), phrase_list.len());
     }
     Ok(count_phrases(&db_path).unwrap_or(0))
 }
@@ -469,7 +461,7 @@ fn collect_source_files(repo: &Path) -> Vec<String> {
                 Err(_) => continue,
             };
             if ft.is_dir() {
-                let name = entry.file_name().to_string_lossy().to_string(); // no follow
+                let name = entry.file_name().to_string_lossy().to_string();
                 if skip_dirs.contains(name.as_str()) || name.starts_with('.') {
                     continue;
                 }
@@ -502,6 +494,11 @@ fn collect_source_files(repo: &Path) -> Vec<String> {
 
 pub fn count_phrases(db_path: &Path) -> Result<usize, String> {
     if let Ok(db) = Connection::open(db_path) {
+        // Try new schema first (phrases table)
+        if let Ok(n) = db.query_row("SELECT COUNT(*) FROM phrases", [], |r| r.get::<_, i64>(0)) {
+            if n > 0 { return Ok(n as usize); }
+        }
+        // Fallback to old schema
         if let Ok(n) = db.query_row("SELECT COUNT(DISTINCT phrase) FROM phrase_occ", [], |r| r.get::<_, i64>(0)) {
             return Ok(n as usize);
         }

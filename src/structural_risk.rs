@@ -16,8 +16,8 @@ pub fn who_calls(db_path: &str, name: &str) -> Vec<(String, f64)> {
     // Get file_id for the definition
     let def_fid: Option<i64> = db.query_row(
         "SELECT po.file_id FROM phrase_occ po
-         JOIN file_map fm ON fm.id = po.file_id
-         WHERE po.phrase = ?1 AND po.is_def = 1
+         JOIN phrases p ON p.id = po.phrase_id
+         WHERE p.phrase = ?1 AND po.is_def = 1
          LIMIT 1",
         [name],
         |r| r.get(0),
@@ -28,8 +28,9 @@ pub fn who_calls(db_path: &str, name: &str) -> Vec<(String, f64)> {
         let mut stmt = db.prepare(
             "SELECT fm.file_path, po.count
              FROM phrase_occ po
+             JOIN phrases p ON p.id = po.phrase_id
              JOIN file_map fm ON fm.id = po.file_id
-             WHERE po.phrase = ?1 AND po.file_id != ?2
+             WHERE p.phrase = ?1 AND po.file_id != ?2
              ORDER BY po.count DESC
              LIMIT 20"
         ).unwrap();
@@ -71,9 +72,10 @@ pub fn latent_deps(db_path: &str, file: &str) -> Vec<(String, f64)> {
 
     // Find rare phrases (df <= 3) that this file defines
     let mut rare_q = db.prepare(
-        "SELECT po.phrase FROM phrase_occ po
+        "SELECT p.phrase FROM phrase_occ po
+         JOIN phrases p ON p.id = po.phrase_id
          WHERE po.file_id = ?1 AND po.is_def = 1
-         AND (SELECT COUNT(*) FROM phrase_occ WHERE phrase = po.phrase) <= 3
+         AND (SELECT COUNT(*) FROM phrase_occ po2 WHERE po2.phrase_id = po.phrase_id) <= 3
          LIMIT 50"
     ).unwrap();
     let rare_phrases: Vec<String> = rare_q.query_map([fid], |r| {
@@ -89,8 +91,9 @@ pub fn latent_deps(db_path: &str, file: &str) -> Vec<(String, f64)> {
         let mut stmt = db.prepare(
             "SELECT fm.file_path
              FROM phrase_occ po
+             JOIN phrases p ON p.id = po.phrase_id
              JOIN file_map fm ON fm.id = po.file_id
-             WHERE po.phrase = ?1 AND po.file_id != ?2
+             WHERE p.phrase = ?1 AND po.file_id != ?2
              LIMIT 10"
         ).unwrap();
         let rows = stmt.query_map(rusqlite::params![phrase, fid], |r| {
@@ -121,7 +124,9 @@ pub fn blast_radius(db_path: &str, file: &str) -> Vec<(String, f64)> {
 
     // Get distinctive phrases (is_def > 0) from this file in a batch query
     let mut phrase_q = db.prepare(
-        "SELECT phrase, count FROM phrase_occ WHERE file_id=?1 AND is_def>0 LIMIT 50"
+        "SELECT p.phrase, po.count FROM phrase_occ po
+         JOIN phrases p ON p.id = po.phrase_id
+         WHERE po.file_id=?1 AND po.is_def>0 LIMIT 50"
     ).unwrap();
     let phrases: Vec<(String, f64)> = phrase_q.query_map([fid], |r| {
         Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?))
@@ -138,7 +143,9 @@ pub fn blast_radius(db_path: &str, file: &str) -> Vec<(String, f64)> {
         // Simple approach: iterate phrases and collect results
         for (phrase, count) in &phrases {
             let mut q = db.prepare(
-                "SELECT file_id FROM phrase_occ WHERE phrase=?1 AND file_id!=?2 LIMIT 10"
+                "SELECT po.file_id FROM phrase_occ po
+                 JOIN phrases p ON p.id = po.phrase_id
+                 WHERE p.phrase=?1 AND po.file_id!=?2 LIMIT 10"
             ).unwrap();
             let rows: Vec<i64> = q.query_map(params![phrase, fid], |r| r.get::<_, i64>(0))
                 .unwrap().filter_map(|r| r.ok()).collect();
@@ -180,7 +187,7 @@ pub fn find_verify_candidates(db_path: &str, file: &str) -> Vec<(String, f64)> {
     let mut stmt = db.prepare(
         "SELECT fm.file_path, COUNT(*) as overlap
          FROM phrase_occ po1
-         JOIN phrase_occ po2 ON po2.phrase = po1.phrase AND po2.file_id != po1.file_id
+         JOIN phrase_occ po2 ON po2.phrase_id = po1.phrase_id AND po2.file_id != po1.file_id
          JOIN file_map fm ON fm.id = po2.file_id
          WHERE po1.file_id = ?1 AND po2.is_def > 0
            AND (fm.file_path LIKE '%test%' OR fm.file_path LIKE '%spec%' OR fm.file_path LIKE '%__tests__%')
@@ -217,9 +224,10 @@ pub fn hologram_plan(
         if let Ok(mut stmt) = db.prepare(
             "SELECT fm.file_path, po.count, po.is_def, fs.token_len
              FROM phrase_occ po
+             JOIN phrases p ON p.id = po.phrase_id
              JOIN file_map fm ON fm.id = po.file_id
              JOIN file_stats fs ON fs.file_id = po.file_id
-             WHERE po.phrase = ?1
+             WHERE p.phrase = ?1
              LIMIT 50"
         ) {
             let rows = stmt.query_map([st], |r| {
