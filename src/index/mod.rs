@@ -1,4 +1,4 @@
-mod schema;
+pub(crate) mod schema;
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -435,13 +435,15 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
         }
     }
 
-    // Bulk INSERT phrase_occ with prepared statement
+    // Bulk INSERT phrase_occ with packed format
     {
         let tx = db.unchecked_transaction().map_err(|e| format!("tx: {}", e))?;
-        let mut stmt = tx.prepare(
-            "INSERT INTO phrase_occ (phrase_id, file_id, is_def, zone_int, count, line_nos)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+        let mut occ_stmt = tx.prepare(
+            "INSERT INTO phrase_occ (phrase_id, file_id, flags, line_nos) VALUES (?1, ?2, ?3, ?4)"
         ).map_err(|e| format!("prepare: {}", e))?;
+        let mut overflow_stmt = tx.prepare(
+            "INSERT INTO count_overflow (phrase_id, file_id, count) VALUES (?1, ?2, ?3)"
+        ).map_err(|e| format!("prepare overflow: {}", e))?;
 
         for ((pid, fid), [is_def_orig, zone_code, count, first_line]) in &sorted {
             let mut is_def = *is_def_orig;
@@ -458,11 +460,18 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
                 if df == 1 { *unique_def_counts.entry(*fid).or_insert(0) += 1; }
             }
 
-            let line_bytes = first_line.to_le_bytes();
-            stmt.execute(rusqlite::params![pid, fid, is_def, zone_code, count, &line_bytes[..]])
+            let flags = schema::pack_flags(is_def, *zone_code, *count as u32);
+            let line_bytes = schema::pack_line_nos(*first_line as u32);
+            occ_stmt.execute(rusqlite::params![pid, fid, flags.as_slice(), line_bytes.as_slice()])
                 .map_err(|e| format!("insert: {}", e))?;
+
+            if *count > 30 {
+                overflow_stmt.execute(rusqlite::params![pid, fid, count])
+                    .map_err(|e| format!("overflow insert: {}", e))?;
+            }
         }
-        drop(stmt);
+        drop(occ_stmt);
+        drop(overflow_stmt);
         tx.commit().map_err(|e| format!("commit: {}", e))?;
     }
     fs::write("/tmp/eh_progress.txt", "phrase_occ done, stats...\n").ok();

@@ -5,6 +5,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use rusqlite::{Connection, params};
 
+use crate::index::schema;
+
 /// Find files that call/use a given identifier via phrase index.
 pub fn who_calls(db_path: &str, name: &str) -> Vec<(String, f64)> {
     let db = match Connection::open(db_path) {
@@ -13,32 +15,41 @@ pub fn who_calls(db_path: &str, name: &str) -> Vec<(String, f64)> {
     };
     let mut results = Vec::new();
 
-    // Get file_id for the definition
-    let def_fid: Option<i64> = db.query_row(
-        "SELECT po.file_id FROM phrase_occ po
-         JOIN phrases p ON p.id = po.phrase_id
-         WHERE p.phrase = ?1 AND po.is_def = 1
-         LIMIT 1",
-        [name],
-        |r| r.get(0),
-    ).ok();
-
-    if let Some(fid) = def_fid {
-        // Find files that share phrases + check co-change if entangle cache exists
+    // Find definition file(s) with is_def=1 — unpack in Rust
+    let def_fids: Vec<i64> = {
         let mut stmt = db.prepare(
-            "SELECT fm.file_path, po.count
+            "SELECT po.file_id, po.flags FROM phrase_occ po
+             JOIN phrases p ON p.id = po.phrase_id
+             WHERE p.phrase = ?1 LIMIT 5"
+        ).unwrap();
+        stmt.query_map([name], |r| {
+            let fid = r.get::<_, i64>(0)?;
+            let flags = r.get::<_, Vec<u8>>(1)?;
+            let f = if flags.len() >= 1 { flags[0] } else { 0 };
+            Ok((fid, schema::unpack_is_def(f)))
+        }).unwrap()
+        .filter_map(|r| r.ok())
+        .filter(|(_, is_def)| *is_def == 1)
+        .map(|(fid, _)| fid)
+        .collect()
+    };
+
+    if let Some(&fid) = def_fids.first() {
+        // Find files that share phrases + get count from overflow
+        let mut stmt = db.prepare(
+            "SELECT fm.file_path,
+                    COALESCE(oc.count, 1) as effective_count
              FROM phrase_occ po
              JOIN phrases p ON p.id = po.phrase_id
              JOIN file_map fm ON fm.id = po.file_id
+             LEFT JOIN count_overflow oc ON oc.phrase_id = po.phrase_id AND oc.file_id = po.file_id
              WHERE p.phrase = ?1 AND po.file_id != ?2
-             ORDER BY po.count DESC
              LIMIT 20"
         ).unwrap();
         let rows = stmt.query_map(rusqlite::params![name, fid], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, f64>(1)?,
-            ))
+            let fp = r.get::<_, String>(0)?;
+            let count = r.get::<_, f64>(1)?;
+            Ok((fp, count))
         }).unwrap();
         for row in rows.flatten() {
             results.push(row);
@@ -56,7 +67,6 @@ pub fn latent_deps(db_path: &str, file: &str) -> Vec<(String, f64)> {
         Err(_) => return vec![],
     };
 
-    // Get file_id
     let fid: Option<i64> = db.query_row(
         "SELECT id FROM file_map WHERE file_path = ?1",
         [file],
@@ -65,27 +75,31 @@ pub fn latent_deps(db_path: &str, file: &str) -> Vec<(String, f64)> {
 
     if fid.is_none() { db.close().ok(); return vec![]; }
     let fid = fid.unwrap();
-
-    // Get file's phrase set path
     let fp = file.to_string();
     let module = fp.rsplitn(2, '/').last().unwrap_or(&fp).to_string();
 
-    // Find rare phrases (df <= 3) that this file defines
+    // Find rare phrases (df <= 3) that this file defines — unpack is_def in Rust
     let mut rare_q = db.prepare(
-        "SELECT p.phrase FROM phrase_occ po
+        "SELECT p.phrase, po.flags FROM phrase_occ po
          JOIN phrases p ON p.id = po.phrase_id
-         WHERE po.file_id = ?1 AND po.is_def = 1
+         WHERE po.file_id = ?1
          AND (SELECT COUNT(*) FROM phrase_occ po2 WHERE po2.phrase_id = po.phrase_id) <= 3
          LIMIT 50"
     ).unwrap();
     let rare_phrases: Vec<String> = rare_q.query_map([fid], |r| {
-        r.get::<_, String>(0)
-    }).unwrap().filter_map(|r| r.ok()).collect();
+        let phrase = r.get::<_, String>(0)?;
+        let flags = r.get::<_, Vec<u8>>(1)?;
+        let f = if flags.len() >= 1 { flags[0] } else { 0 };
+        Ok((phrase, schema::unpack_is_def(f)))
+    }).unwrap()
+    .filter_map(|r| r.ok())
+    .filter(|(_, is_def)| *is_def == 1)
+    .map(|(phrase, _)| phrase)
+    .collect();
     drop(rare_q);
 
     if rare_phrases.is_empty() { db.close().ok(); return vec![]; }
 
-    // Find files in OTHER modules sharing these rare phrases
     let mut score_map: HashMap<String, f64> = HashMap::new();
     for phrase in &rare_phrases {
         let mut stmt = db.prepare(
@@ -100,10 +114,9 @@ pub fn latent_deps(db_path: &str, file: &str) -> Vec<(String, f64)> {
             r.get::<_, String>(0)
         }).unwrap();
         for row in rows.flatten() {
-            let other_fp = row;
-            let other_module = other_fp.rsplitn(2, '/').last().unwrap_or(&other_fp).to_string();
+            let other_module = row.rsplitn(2, '/').last().unwrap_or(&row).to_string();
             if other_module != module {
-                *score_map.entry(other_fp).or_insert(0.0) += 1.0;
+                *score_map.entry(row).or_insert(0.0) += 1.0;
             }
         }
     }
@@ -122,37 +135,43 @@ pub fn blast_radius(db_path: &str, file: &str) -> Vec<(String, f64)> {
         None => return vec![],
     };
 
-    // Get distinctive phrases (is_def > 0) from this file in a batch query
+    // Get distinctive phrases (is_def > 0) — unpack in Rust
     let mut phrase_q = db.prepare(
-        "SELECT p.phrase, po.count FROM phrase_occ po
+        "SELECT p.phrase, po.flags,
+                COALESCE(oc.count, 1) as effective_count
+         FROM phrase_occ po
          JOIN phrases p ON p.id = po.phrase_id
-         WHERE po.file_id=?1 AND po.is_def>0 LIMIT 50"
+         LEFT JOIN count_overflow oc ON oc.phrase_id = po.phrase_id AND oc.file_id = po.file_id
+         WHERE po.file_id=?1 LIMIT 50"
     ).unwrap();
     let phrases: Vec<(String, f64)> = phrase_q.query_map([fid], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?))
-    }).unwrap().filter_map(|r| r.ok()).collect();
+        let phrase = r.get::<_, String>(0)?;
+        let flags = r.get::<_, Vec<u8>>(1)?;
+        let count = r.get::<_, f64>(2)?;
+        let f = if flags.len() >= 1 { flags[0] } else { 0 };
+        let is_def = schema::unpack_is_def(f);
+        Ok((phrase, count, is_def))
+    }).unwrap()
+    .filter_map(|r| r.ok())
+    .filter(|(_, _, is_def)| *is_def > 0)
+    .map(|(phrase, count, _)| (phrase, count))
+    .collect();
     drop(phrase_q);
 
     if phrases.is_empty() { return vec![]; }
 
-    // Find other files sharing these phrases
     let mut other_scores: HashMap<i64, f64> = HashMap::new();
-    if !phrases.is_empty() {
-        // Build a batch query: select all other file_ids sharing any of these phrases
-        let phrase_list: Vec<&str> = phrases.iter().map(|(p, _)| p.as_str()).collect();
-        // Simple approach: iterate phrases and collect results
-        for (phrase, count) in &phrases {
-            let mut q = db.prepare(
-                "SELECT po.file_id FROM phrase_occ po
-                 JOIN phrases p ON p.id = po.phrase_id
-                 WHERE p.phrase=?1 AND po.file_id!=?2 LIMIT 10"
-            ).unwrap();
-            let rows: Vec<i64> = q.query_map(params![phrase, fid], |r| r.get::<_, i64>(0))
-                .unwrap().filter_map(|r| r.ok()).collect();
-            drop(q);
-            for ofid in rows {
-                *other_scores.entry(ofid).or_insert(0.0) += count;
-            }
+    for (phrase, count) in &phrases {
+        let mut q = db.prepare(
+            "SELECT po.file_id FROM phrase_occ po
+             JOIN phrases p ON p.id = po.phrase_id
+             WHERE p.phrase=?1 AND po.file_id!=?2 LIMIT 10"
+        ).unwrap();
+        let rows: Vec<i64> = q.query_map(params![phrase, fid], |r| r.get::<_, i64>(0))
+            .unwrap().filter_map(|r| r.ok()).collect();
+        drop(q);
+        for ofid in rows {
+            *other_scores.entry(ofid).or_insert(0.0) += count;
         }
     }
 
@@ -184,22 +203,34 @@ pub fn find_verify_candidates(db_path: &str, file: &str) -> Vec<(String, f64)> {
         None => return vec![],
     };
 
+    // Get overlapping phrases with is_def>0 from test files — unpack in Rust
     let mut stmt = db.prepare(
-        "SELECT fm.file_path, COUNT(*) as overlap
+        "SELECT fm.file_path, po2.flags
          FROM phrase_occ po1
          JOIN phrase_occ po2 ON po2.phrase_id = po1.phrase_id AND po2.file_id != po1.file_id
          JOIN file_map fm ON fm.id = po2.file_id
-         WHERE po1.file_id = ?1 AND po2.is_def > 0
+         WHERE po1.file_id = ?1
            AND (fm.file_path LIKE '%test%' OR fm.file_path LIKE '%spec%' OR fm.file_path LIKE '%__tests__%')
-         GROUP BY po2.file_id
-         ORDER BY overlap DESC
-         LIMIT 10"
+         LIMIT 500"
     ).unwrap();
 
-    let results: Vec<(String, f64)> = stmt.query_map([fid], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?))
-    }).unwrap().filter_map(|r| r.ok()).collect();
+    let mut overlap_map: HashMap<String, f64> = HashMap::new();
+    let rows = stmt.query_map([fid], |r| {
+        let fp = r.get::<_, String>(0)?;
+        let flags = r.get::<_, Vec<u8>>(1)?;
+        let f = if flags.len() >= 1 { flags[0] } else { 0 };
+        Ok((fp, schema::unpack_is_def(f)))
+    }).unwrap();
+    for row in rows.filter_map(|r| r.ok()) {
+        let (fp, is_def) = row;
+        if is_def > 0 {
+            *overlap_map.entry(fp).or_insert(0.0) += 1.0;
+        }
+    }
 
+    let mut results: Vec<(String, f64)> = overlap_map.into_iter().collect();
+    results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    results.truncate(10);
     results
 }
 pub fn hologram_plan(
@@ -214,15 +245,13 @@ pub fn hologram_plan(
     let n_docs: f64 = db.query_row("SELECT COUNT(*) FROM file_map", [], |r| r.get(0)).unwrap_or(1.0);
     let avgdl: f64 = db.query_row("SELECT value FROM meta WHERE key='avgdl'", [], |r| r.get(0)).unwrap_or(100.0);
 
-    // Simple risk assessment based on keyword matching
     let task_phrases: Vec<String> = crate::zone::extract_phrases(task);
     let task_lower: Vec<String> = task_phrases.iter().map(|p| p.to_lowercase()).collect();
 
-    // Find files matching task
     let mut file_scores: HashMap<String, f64> = HashMap::new();
     for st in &task_lower {
         if let Ok(mut stmt) = db.prepare(
-            "SELECT fm.file_path, po.count, po.is_def, fs.token_len
+            "SELECT fm.file_path, po.flags, fs.token_len
              FROM phrase_occ po
              JOIN phrases p ON p.id = po.phrase_id
              JOIN file_map fm ON fm.id = po.file_id
@@ -231,16 +260,17 @@ pub fn hologram_plan(
              LIMIT 50"
         ) {
             let rows = stmt.query_map([st], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, f64>(1)?,
-                    r.get::<_, i32>(2)?,
-                    r.get::<_, f64>(3)?,
-                ))
+                let fp = r.get::<_, String>(0)?;
+                let flags = r.get::<_, Vec<u8>>(1)?;
+                let doc_len = r.get::<_, f64>(2)?;
+                let f = if flags.len() >= 1 { flags[0] } else { 0 };
+                let base_count = schema::unpack_count(f);
+                let tf = if base_count >= 31 { 1.0 } else { base_count as f64 };
+                Ok((fp, tf, schema::unpack_is_def(f), doc_len))
             }).unwrap();
             for row in rows.flatten() {
                 let (fp, tf, is_def, doc_len) = row;
-                let idf = crate::search::bm25::bm25_idf(n_docs, 5.0); // rough IDF
+                let idf = crate::search::bm25::bm25_idf(n_docs, 5.0);
                 let score = crate::search::bm25::bm25_score(idf, tf, doc_len, avgdl);
                 let def_mult = if is_def > 0 { 5.0 } else { 1.0 };
                 *file_scores.entry(fp).or_insert(0.0) += score * def_mult;
@@ -252,7 +282,6 @@ pub fn hologram_plan(
     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     scored.truncate(10);
 
-    // Build plan
     let read_files: Vec<String> = scored.iter().take(3).map(|(fp, _)| fp.clone()).collect();
     let verify_candidates: Vec<String> = scored.iter()
         .filter(|(fp, _)| fp.contains("test"))

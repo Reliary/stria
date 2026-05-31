@@ -1,7 +1,6 @@
 use rusqlite::Connection;
 
 pub fn create_new_db(db: &Connection) -> rusqlite::Result<()> {
-    // page_size must be set BEFORE any table creation
     db.execute_batch(
         "PRAGMA synchronous = OFF;
          PRAGMA journal_mode = MEMORY;
@@ -37,10 +36,14 @@ fn create_tables(db: &Connection) -> rusqlite::Result<()> {
         CREATE TABLE IF NOT EXISTS phrase_occ (
             phrase_id INTEGER,
             file_id INTEGER,
-            is_def INTEGER DEFAULT 0,
-            zone_int INTEGER DEFAULT 0,
-            count INTEGER DEFAULT 1,
-            line_nos BLOB,
+            flags BLOB NOT NULL,
+            line_nos BLOB NOT NULL,
+            PRIMARY KEY (phrase_id, file_id)
+        ) WITHOUT ROWID;
+        CREATE TABLE IF NOT EXISTS count_overflow (
+            phrase_id INTEGER,
+            file_id INTEGER,
+            count INTEGER NOT NULL,
             PRIMARY KEY (phrase_id, file_id)
         ) WITHOUT ROWID;
         CREATE TABLE IF NOT EXISTS file_stats (
@@ -56,11 +59,50 @@ fn create_tables(db: &Connection) -> rusqlite::Result<()> {
             value REAL
         );"
     )?;
-    // Migration: old schema may have phrase TEXT + zone TEXT columns
-    db.execute_batch("ALTER TABLE phrase_occ ADD COLUMN zone_int INTEGER DEFAULT 0;").ok();
     Ok(())
 }
 
 pub fn rebuild_primary_key(_db: &Connection) -> rusqlite::Result<()> {
     Ok(())
+}
+
+// --- Packing helpers ---
+// is_def: [-1, 0, 1, 2] → packed: [0, 1, 2, 3] (add 1, 2 bits)
+// zone_int: [0, 1] → packed: [0, 1] (1 bit)
+// count: [0..30] direct, 31 = overflow (5 bits)
+const COUNT_OVERFLOW: u8 = 31;
+
+pub fn pack_flags(is_def: i32, zone_int: i32, count: u32) -> [u8; 1] {
+    let is_def_packed = ((is_def + 1) as u8) & 0x03;        // 2 bits: -1→0, 0→1, 1→2, 2→3
+    let zone_packed = (zone_int as u8) & 0x01;               // 1 bit
+    let count_packed = if count <= 30 { count as u8 } else { COUNT_OVERFLOW };
+    [is_def_packed | (zone_packed << 2) | (count_packed << 3)]
+}
+
+pub fn unpack_is_def(flags: u8) -> i32 {
+    ((flags & 0x03) as i32) - 1
+}
+
+pub fn unpack_zone_int(flags: u8) -> i32 {
+    ((flags >> 2) & 0x01) as i32
+}
+
+pub fn unpack_count(flags: u8) -> u32 {
+    (flags >> 3) as u32
+}
+
+pub fn is_count_overflow(flags: u8) -> bool {
+    unpack_count(flags) >= COUNT_OVERFLOW as u32
+}
+
+pub fn pack_line_nos(line: u32) -> [u8; 2] {
+    (line as u16).to_le_bytes()
+}
+
+pub fn unpack_line_nos(blob: &[u8]) -> u32 {
+    if blob.len() >= 2 {
+        u16::from_le_bytes([blob[0], blob[1]]) as u32
+    } else {
+        0
+    }
 }

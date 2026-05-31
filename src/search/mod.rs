@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use rusqlite::{Connection, params};
 
 use crate::zone;
+use crate::index::schema;
 
 /// BM25 scoring for phrase search.
 pub mod bm25;
@@ -125,32 +126,37 @@ pub fn search_phrases(
     for st in &search_terms {
         let idf = idf_map.get(st).copied().unwrap_or(1.0);
         let mut exact_q = match db.prepare(
-            "SELECT po.file_id, po.count, po.is_def, po.zone_int, fs.token_len,
+            "SELECT po.file_id, po.flags, po.line_nos, fs.token_len,
                     fs.unique_def_count, fs.total_def_count, fs.comment_ratio,
-                    po.line_nos
+                    COALESCE(oc.count, 1) as effective_count
              FROM phrase_occ po
              JOIN phrases p ON p.id = po.phrase_id
              JOIN file_stats fs ON fs.file_id = po.file_id
+             LEFT JOIN count_overflow oc ON oc.phrase_id = po.phrase_id AND oc.file_id = po.file_id
              WHERE p.phrase = ?1"
         ) {
             Ok(q) => q,
             Err(_) => continue,
         };
         let rows_result = exact_q.query_map([st], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, f64>(1)?,
-                r.get::<_, i32>(2)?,
-                r.get::<_, i32>(3)?,
-                r.get::<_, f64>(4)?,
-                r.get::<_, i64>(5)?,
-                r.get::<_, i64>(6)?,
-                r.get::<_, f64>(7)?,
-                r.get::<_, Vec<u8>>(8)?,
-            ))
+            let fid = r.get::<_, i64>(0)?;
+            let flags = r.get::<_, Vec<u8>>(1)?;
+            let line_blob = r.get::<_, Vec<u8>>(2)?;
+            let doc_len = r.get::<_, f64>(3)?;
+            let uniq_def = r.get::<_, i64>(4)?;
+            let total_def = r.get::<_, i64>(5)?;
+            let comment_ratio = r.get::<_, f64>(6)?;
+            let overflow_count = r.get::<_, u32>(7)?;
+            let f = if flags.len() >= 1 { flags[0] } else { 0 };
+            let is_def = schema::unpack_is_def(f);
+            let zone_int = schema::unpack_zone_int(f);
+            let base_count = schema::unpack_count(f);
+            let tf = if base_count >= 31 { overflow_count as f64 } else { base_count as f64 };
+            let first_line = schema::unpack_line_nos(&line_blob) as i32;
+            Ok((fid, tf, is_def, zone_int, doc_len, uniq_def, total_def, comment_ratio, first_line))
         }).unwrap();
         for row in rows_result.filter_map(|r| r.ok()) {
-            let (fid, tf, is_def, zone_int, doc_len, uniq_def, total_def, comment_ratio, line_nos) = row;
+            let (fid, tf, is_def, zone_int, doc_len, uniq_def, total_def, comment_ratio, first_line) = row;
             let score = bm25::bm25_score(idf, tf, doc_len, avgdl);
             let zone_mult = if zone_int == 0 { 2.0 } else { 0.25 };
             let def_mult = match is_def { 2 => 8.0, 1 => 5.0, -1 => 2.0, _ => 1.0 };
@@ -161,7 +167,7 @@ pub fn search_phrases(
             *file_scores.entry(fid).or_insert(0.0) += score * zone_mult * def_mult * uniq_mult * comment_mult;
             file_tiers.entry(fid).or_insert(0);
             *file_phrases_matched.entry(fid).or_insert(0) += 1;
-            if let Some(first_line) = unpack_first_line(&line_nos) {
+            if first_line > 0 {
                 file_line_sets.entry(fid).or_default()
                     .entry(st.clone()).or_default()
                     .push(first_line);
@@ -176,7 +182,7 @@ pub fn search_phrases(
         let idf_rare = idf.powf(1.5) * 0.3;
 
         let mut prefix_q = match db.prepare(
-            "SELECT po.file_id, po.is_def, po.zone_int, fs.token_len,
+            "SELECT po.file_id, po.flags, fs.token_len,
                     fs.unique_def_count, fs.total_def_count, fs.comment_ratio
              FROM phrase_occ po
              JOIN phrases p ON p.id = po.phrase_id
@@ -187,15 +193,14 @@ pub fn search_phrases(
             Err(_) => continue,
         };
         let prefix_rows = prefix_q.query_map(params![&pattern, st], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, i32>(1)?,
-                r.get::<_, i32>(2)?,
-                r.get::<_, f64>(3)?,
-                r.get::<_, i64>(4)?,
-                r.get::<_, i64>(5)?,
-                r.get::<_, f64>(6)?,
-            ))
+            let fid = r.get::<_, i64>(0)?;
+            let flags = r.get::<_, Vec<u8>>(1)?;
+            let doc_len = r.get::<_, f64>(2)?;
+            let uniq_def = r.get::<_, i64>(3)?;
+            let total_def = r.get::<_, i64>(4)?;
+            let comment_ratio = r.get::<_, f64>(5)?;
+            let f = if flags.len() >= 1 { flags[0] } else { 0 };
+            Ok((fid, schema::unpack_is_def(f), schema::unpack_zone_int(f), doc_len, uniq_def, total_def, comment_ratio))
         }).unwrap();
         for row in prefix_rows.filter_map(|r| r.ok()) {
             let (fid, is_def, zone_int, doc_len, uniq_def, total_def, comment_ratio) = row;
@@ -223,7 +228,7 @@ pub fn search_phrases(
         let excl_prefix = format!("{}%", st);
 
         let mut sub_q = match db.prepare(
-            "SELECT po.file_id, po.count, po.is_def, po.zone_int, fs.token_len,
+            "SELECT po.file_id, po.flags, fs.token_len,
                     fs.comment_ratio
              FROM phrase_occ po
              JOIN phrases p ON p.id = po.phrase_id
@@ -235,17 +240,16 @@ pub fn search_phrases(
             Err(_) => continue,
         };
         let sub_rows = sub_q.query_map(params![&pattern, &excl_prefix, st], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, f64>(1)?,
-                r.get::<_, i32>(2)?,
-                r.get::<_, i32>(3)?,
-                r.get::<_, f64>(4)?,
-                r.get::<_, f64>(5)?,
-            ))
+            let fid = r.get::<_, i64>(0)?;
+            let flags = r.get::<_, Vec<u8>>(1)?;
+            let doc_len = r.get::<_, f64>(2)?;
+            let comment_ratio = r.get::<_, f64>(3)?;
+            let f = if flags.len() >= 1 { flags[0] } else { 0 };
+            Ok((fid, schema::unpack_is_def(f), schema::unpack_zone_int(f), doc_len, comment_ratio))
         }).unwrap();
         for row in sub_rows.filter_map(|r| r.ok()) {
-            let (fid, tf, is_def, zone_int, doc_len, comment_ratio) = row;
+            let (fid, is_def, zone_int, doc_len, comment_ratio) = row;
+            let tf = 1.0;
             let score = bm25::bm25_score(idf, tf, doc_len, avgdl);
             let zone_mult = if zone_int == 0 { 2.0 } else { 0.25 };
             let def_mult = match is_def { 2 => 8.0, 1 => 5.0, -1 => 2.0, _ => 1.0 };
