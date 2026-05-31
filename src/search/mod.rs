@@ -144,6 +144,10 @@ fn _search_phrases(
 
     let raw_terms: Vec<String> = zone::extract_phrases(query);
     if raw_terms.is_empty() { return vec![]; }
+    if raw_terms.len() > 100 {
+        eprintln!("eh:warn: search query has {} terms, truncating to 100", raw_terms.len());
+    }
+    let raw_terms: Vec<String> = raw_terms.into_iter().take(100).collect();
 
     // Build search_terms: original casing + stems
     let mut search_terms: Vec<String> = Vec::new();
@@ -291,7 +295,8 @@ fn _search_phrases(
              FROM phrase_occ po
              JOIN phrases p ON p.id = po.phrase_id
              JOIN file_stats fs ON fs.file_id = po.file_id
-             WHERE p.phrase LIKE ?1 AND p.phrase != ?2"
+             WHERE p.phrase LIKE ?1 AND p.phrase != ?2
+             LIMIT 5000"
         ) {
             Ok(q) => q,
             Err(_) => continue,
@@ -343,7 +348,7 @@ fn _search_phrases(
              JOIN phrases p ON p.id = po.phrase_id
              JOIN file_stats fs ON fs.file_id = po.file_id
              WHERE p.phrase LIKE ?1 AND p.phrase NOT LIKE ?2 AND p.phrase != ?3
-             LIMIT 200"
+              LIMIT 5000"
         ) {
             Ok(q) => q,
             Err(_) => continue,

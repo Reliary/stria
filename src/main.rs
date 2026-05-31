@@ -98,6 +98,7 @@ fn mcp_server(repo_path: &str) {
         {"name": "latent_deps", "description": "Find hidden cross-module dependencies that imports don't reveal. Use when: checking if a refactor reaches outside the current module. Input: file path relative to repo root.", "inputSchema": {"type": "object", "properties": {"file": {"type": "string"}}, "required": ["file"]}},
         {"name": "cross_horizon", "description": "Expand a [HORIZON: hash] marker to full function body. Use when: orient output shows an horizon marker and you need to read the function source. Input: the hex hash from the marker.", "inputSchema": {"type": "object", "properties": {"hash": {"type": "string"}}, "required": ["hash"]}},
         {"name": "search_horizon", "description": "Find horizon hashes by function name. Use when: you know a function name and need its hash for cross_horizon. Input: function name or partial name.", "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}},
+        {"name": "eh_health", "description": "Server health check. Returns DB stats and latency. Use when: connection issues or monitoring.", "inputSchema": {"type": "object", "properties": {}, "required": []}},
     ]);
 
     for line in io::stdin().lock().lines() {
@@ -296,6 +297,39 @@ fn mcp_server(repo_path: &str) {
                             .and_then(|f| f.as_str()).unwrap_or("");
                         let results = structural_risk::latent_deps(&db_path, file);
                         json!({"deps": results})
+                    }
+                    "eh_health" => {
+                        let t0 = std::time::Instant::now();
+                        let mut n_phrases = 0i64;
+                        let mut n_files = 0i64;
+                        let mut avgdl = 0.0f64;
+                        let mut build_time_f = 0.0f64;
+                        if let Ok(db) = rusqlite::Connection::open(&db_path) {
+                            n_files = db.query_row("SELECT COUNT(*) FROM file_map", [], |r| r.get(0)).unwrap_or(0);
+                            n_phrases = db.query_row("SELECT COUNT(*) FROM phrase_occ", [], |r| r.get(0)).unwrap_or(0);
+                            avgdl = db.query_row("SELECT COALESCE(value,0) FROM meta WHERE key='avgdl'", [], |r| r.get(0)).unwrap_or(0.0);
+                            build_time_f = db.query_row(
+                                "SELECT COALESCE(value,0) FROM meta WHERE key='build_time'", [], |r| r.get(0)
+                            ).unwrap_or(0.0);
+                        }
+                        let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                        let build_date = if build_time_f > 0.0 {
+                            let secs = build_time_f as u64;
+                            let d = std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+                            format!("{:?}", d)
+                        } else {
+                            "unknown".to_string()
+                        };
+                        json!({
+                            "status": "ok",
+                            "ok": true,
+                            "phrases": n_phrases,
+                            "files": n_files,
+                            "avgdl": avgdl,
+                            "build_date": format!("{:.0}", build_time_f),
+                            "build_time_readable": build_date,
+                            "ms": ms,
+                        })
                     }
                     _ => {
                         json!({"error": format!("Unknown tool: {}", name)})

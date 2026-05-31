@@ -11,32 +11,43 @@ use crate::index::schema;
 pub fn who_calls(db_path: &str, name: &str) -> Vec<(String, f64)> {
     let db = match Connection::open(db_path) {
         Ok(d) => d,
-        Err(_) => return vec![],
+        Err(e) => {
+            eprintln!("eh:error: who_calls: db open failed: {}", e);
+            return vec![];
+        }
     };
     let mut results = Vec::new();
 
     // Find definition file(s) with is_def=1 — unpack in Rust
     let def_fids: Vec<i64> = {
-        let mut stmt = db.prepare(
+        let mut stmt = match db.prepare(
             "SELECT po.file_id, po.flags FROM phrase_occ po
              JOIN phrases p ON p.id = po.phrase_id
              WHERE p.phrase = ?1 LIMIT 5"
-        ).unwrap();
-        stmt.query_map([name], |r| {
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("eh:warn: who_calls: prepare failed: {}", e);
+                return vec![];
+            }
+        };
+        let rows: Vec<(i64, i32)> = match stmt.query_map([name], |r| {
             let fid = r.get::<_, i64>(0)?;
             let flags = r.get::<_, Vec<u8>>(1)?;
             let f = if flags.len() >= 1 { flags[0] } else { 0 };
             Ok((fid, schema::unpack_is_def(f)))
-        }).unwrap()
-        .filter_map(|r| r.ok())
-        .filter(|(_, is_def)| *is_def == 1)
-        .map(|(fid, _)| fid)
-        .collect()
+        }) {
+            Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+            Err(e) => {
+                eprintln!("eh:warn: who_calls: query failed for '{}': {}", name, e);
+                vec![]
+            }
+        };
+        rows.into_iter().filter(|(_, is_def)| *is_def == 1).map(|(fid, _)| fid).collect()
     };
 
     if let Some(&fid) = def_fids.first() {
-        // Find files that share phrases + get count from overflow
-        let mut stmt = db.prepare(
+        let mut stmt = match db.prepare(
             "SELECT fm.file_path,
                     COALESCE(oc.count, 1) as effective_count
              FROM phrase_occ po
@@ -45,13 +56,25 @@ pub fn who_calls(db_path: &str, name: &str) -> Vec<(String, f64)> {
              LEFT JOIN count_overflow oc ON oc.phrase_id = po.phrase_id AND oc.file_id = po.file_id
              WHERE p.phrase = ?1 AND po.file_id != ?2
              LIMIT 20"
-        ).unwrap();
-        let rows = stmt.query_map(rusqlite::params![name, fid], |r| {
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("eh:warn: who_calls: second prepare failed: {}", e);
+                return vec![];
+            }
+        };
+        let second_rows: Vec<(String, f64)> = match stmt.query_map(rusqlite::params![name, fid], |r| {
             let fp = r.get::<_, String>(0)?;
             let count = r.get::<_, f64>(1)?;
             Ok((fp, count))
-        }).unwrap();
-        for row in rows.flatten() {
+        }) {
+            Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+            Err(e) => {
+                eprintln!("eh:warn: who_calls: second query failed: {}", e);
+                vec![]
+            }
+        };
+        for row in second_rows {
             results.push(row);
         }
     }
@@ -64,7 +87,10 @@ pub fn who_calls(db_path: &str, name: &str) -> Vec<(String, f64)> {
 pub fn latent_deps(db_path: &str, file: &str) -> Vec<(String, f64)> {
     let db = match Connection::open(db_path) {
         Ok(d) => d,
-        Err(_) => return vec![],
+        Err(e) => {
+            eprintln!("eh:error: latent_deps: db open failed: {}", e);
+            return vec![];
+        }
     };
 
     let fid: Option<i64> = db.query_row(
@@ -187,9 +213,20 @@ pub fn blast_radius(db_path: &str, file: &str) -> Vec<(String, f64)> {
 }
 
 fn open_db_and_file(db_path: &str, file: &str) -> Option<(Connection, i64)> {
-    let db = Connection::open(db_path).ok()?;
-    let fid = db.query_row("SELECT id FROM file_map WHERE file_path=?1", [file], |r| r.get::<_, i64>(0)).ok()?;
-    Some((db, fid))
+    let db = match Connection::open(db_path) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("eh:error: db open failed: {}", e);
+            return None;
+        }
+    };
+    match db.query_row("SELECT id FROM file_map WHERE file_path=?1", [file], |r| r.get::<_, i64>(0)) {
+        Ok(fid) => Some((db, fid)),
+        Err(e) => {
+            eprintln!("eh:warn: file not found in index: '{}': {}", file, e);
+            None
+        }
+    }
 }
 
 fn resolve_file_path(db: &Connection, fid: i64) -> Option<String> {

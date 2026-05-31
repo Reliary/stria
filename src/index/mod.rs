@@ -499,6 +499,14 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
             [avgdl],
         ).map_err(|e| format!("meta: {}", e))?;
 
+        db.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('build_time', ?1)",
+            [std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs_f64()],
+        ).map_err(|e| format!("meta: {}", e))?;
+
         // Skip ANALYZE on large repos — no benefit for search, costs 5s+ on kernel
         if n_files < 5000 {
             db.execute_batch("ANALYZE").ok();
