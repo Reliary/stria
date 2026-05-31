@@ -7,10 +7,22 @@ struct AgentConfig {
 }
 
 const AGENTS: &[AgentConfig] = &[
-    AgentConfig { name: "OpenCode", path: "~/.config/opencode/opencode.json" },
-    AgentConfig { name: "Claude Code", path: "~/.claude/settings.json" },
-    AgentConfig { name: "Cursor", path: "~/.cursor/mcp.json" },
-    AgentConfig { name: "Windsurf", path: "~/.codeium/windsurf/mcp_config.json" },
+    AgentConfig {
+        name: "OpenCode",
+        path: "~/.config/opencode/opencode.json",
+    },
+    AgentConfig {
+        name: "Claude Code",
+        path: "~/.claude/settings.json",
+    },
+    AgentConfig {
+        name: "Cursor",
+        path: "~/.cursor/mcp.json",
+    },
+    AgentConfig {
+        name: "Windsurf",
+        path: "~/.codeium/windsurf/mcp_config.json",
+    },
 ];
 
 fn expand_path(p: &str) -> String {
@@ -39,10 +51,13 @@ fn add_stria(mut cfg: Value, agent: &str) -> Value {
     let binary = stria_binary();
     match agent {
         "OpenCode" => {
-            let entry = cfg.get("stria").cloned().unwrap_or_else(|| {
-                json!({"type": "local", "command": [binary, "serve"]})
-            });
-            cfg.as_object_mut().unwrap().insert("stria".to_string(), entry);
+            let entry = cfg
+                .get("stria")
+                .cloned()
+                .unwrap_or_else(|| json!({"type": "local", "command": [binary, "serve"]}));
+            cfg.as_object_mut()
+                .unwrap()
+                .insert("stria".to_string(), entry);
         }
         _ => {
             let entry = if let Some(s) = cfg.pointer_mut("/mcpServers/stria") {
@@ -52,7 +67,10 @@ fn add_stria(mut cfg: Value, agent: &str) -> Value {
             };
             if let Some(obj) = cfg.as_object_mut() {
                 let servers = obj.entry("mcpServers").or_insert_with(|| json!({}));
-                servers.as_object_mut().unwrap().insert("stria".to_string(), entry);
+                servers
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("stria".to_string(), entry);
             }
         }
     }
@@ -138,7 +156,9 @@ pub fn run_setup(yes: bool) {
             std::io::stdin().read_line(&mut input).unwrap_or(0);
             !input.trim().eq_ignore_ascii_case("n")
         };
-        if !proceed { continue; }
+        if !proceed {
+            continue;
+        }
 
         let content = std::fs::read_to_string(path).unwrap_or_else(|_| "{}".to_string());
         let cfg: Value = serde_json::from_str(&content).unwrap_or(json!({}));
@@ -170,7 +190,9 @@ pub fn run_remove(yes: bool) {
             std::io::stdin().read_line(&mut input).unwrap_or(0);
             input.trim().eq_ignore_ascii_case("y")
         };
-        if !proceed { continue; }
+        if !proceed {
+            continue;
+        }
 
         let content = std::fs::read_to_string(path).unwrap_or_else(|_| "{}".to_string());
         let cfg: Value = serde_json::from_str(&content).unwrap_or(json!({}));

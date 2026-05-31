@@ -149,8 +149,11 @@ fn mcp_server(initial_repo: String) {
 
     let db_path_of = |repo: &str| -> String {
         std::path::Path::new(repo)
-            .join(".horizon").join("phrases.sqlite")
-            .to_str().unwrap_or("").to_string()
+            .join(".horizon")
+            .join("phrases.sqlite")
+            .to_str()
+            .unwrap_or("")
+            .to_string()
     };
 
     let tools = json!([
@@ -560,7 +563,9 @@ fn mcp_server(initial_repo: String) {
                                         *current_repo.lock().unwrap() = canonical;
                                         json!({"status": "ok", "phrases": n})
                                     }
-                                    Err(e) => json!({"error": format!("Index build failed: {}", e)})
+                                    Err(e) => {
+                                        json!({"error": format!("Index build failed: {}", e)})
+                                    }
                                 }
                             } else {
                                 *current_repo.lock().unwrap() = canonical;
