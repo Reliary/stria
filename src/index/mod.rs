@@ -1,5 +1,4 @@
 mod schema;
-mod extract;
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -33,6 +32,7 @@ struct WorkerResult {
     content_lens: HashMap<i64, usize>,
     comment_ratios: HashMap<i64, f64>,
     total_phrases: u32,
+    digests: HashMap<String, String>,
 }
 
 /// Build the phrase index for a repo.
@@ -64,17 +64,57 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
 
     if digest_cache.is_empty() {
         for rel in &files {
-            all_digests.insert(rel.clone(), String::new());
             changed_files.push((rel.clone(), String::new()));
         }
-    } else {
+        // Write mtime cache on first build so second build uses mtime fast path
+        let mut mtimes: HashMap<String, (u64, u32)> = HashMap::with_capacity(files.len());
         for rel in &files {
             let fpath = repo.join(rel);
-            let dig = sha256_file(&fpath).unwrap_or_default();
-            all_digests.insert(rel.clone(), dig.clone());
-            if digest_cache.get(rel) != Some(&dig) {
+            let mtime = fpath.metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .map(|t| t.duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| (d.as_secs(), d.subsec_nanos()))
+                    .unwrap_or((0, 0)))
+                .unwrap_or((0, 0));
+            mtimes.insert(rel.clone(), mtime);
+        }
+        if let Ok(s) = serde_json::to_string(&mtimes) {
+            fs::write(out_dir.join("mtime_cache.json"), s).ok();
+        }
+    } else {
+        // Mtime-based fast path: skip SHA-256 for files whose mtime hasn't changed
+        let mut mtimes: HashMap<String, (u64, u32)> = HashMap::new();
+        if let Ok(s) = fs::read_to_string(out_dir.join("mtime_cache.json")) {
+            if let Ok(v) = serde_json::from_str::<HashMap<String, (u64, u32)>>(&s) {
+                mtimes = v;
+            }
+        }
+        for rel in &files {
+            let fpath = repo.join(rel);
+            let mtime = fpath.metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .map(|t| t.duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| (d.as_secs(), d.subsec_nanos()))
+                    .unwrap_or((0, 0)))
+                .unwrap_or((0, 0));
+            if mtimes.get(rel) == Some(&mtime) && digest_cache.contains_key(rel) {
+                // mtime unchanged → reuse cached digest
+                if let Some(cached) = digest_cache.get(rel) {
+                    all_digests.insert(rel.clone(), cached.clone());
+                }
+            } else {
+                // mtime changed → compute SHA-256
+                let dig = sha256_file(&fpath).unwrap_or_default();
+                all_digests.insert(rel.clone(), dig.clone());
                 changed_files.push((rel.clone(), dig));
             }
+            mtimes.insert(rel.clone(), mtime);
+        }
+        // Write mtime cache for next run
+        if let Ok(s) = serde_json::to_string(&mtimes) {
+            fs::write(out_dir.join("mtime_cache.json"), s).ok();
         }
     }
 
@@ -86,16 +126,8 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
         return count_phrases(&db_path);
     }
 
-    let db = Connection::open(&db_path).map_err(|e| format!("db: {}", e))?;
-    schema::create_schema(&db).map_err(|e| format!("schema: {}", e))?;
-    db.execute_batch(
-        "PRAGMA synchronous = OFF;
-         PRAGMA journal_mode = MEMORY;
-         PRAGMA cache_size = -200000;
-         PRAGMA mmap_size = 268435456;"
-    ).map_err(|e| format!("pragma: {}", e))?;
-
-    let is_full_rebuild = changed_files.len() as f64 >= files.len() as f64 * 0.3 || !db_path.exists() || digest_cache.is_empty();
+    let is_full_rebuild = !db_path.exists() || digest_cache.is_empty()
+        || (changed_files.len() as f64) >= (files.len() as f64 * 0.3);
 
     let source_files: Vec<String> = if is_full_rebuild {
         files.clone()
@@ -116,24 +148,25 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
     // Build file_map
     let mut file_map: Vec<(i64, String)> = Vec::new();
     if is_full_rebuild {
-        if let Ok(_) = db.execute("DELETE FROM file_map", []) {}
-        if let Ok(_) = db.execute("DELETE FROM phrases", []) {}
-        if let Ok(_) = db.execute("DELETE FROM phrase_occ", []) {}
         for (i, rel) in files.iter().enumerate() {
             file_map.push(((i + 1) as i64, rel.clone()));
         }
     } else {
         let mut existing: HashMap<String, i64> = HashMap::new();
-        if let Ok(mut get_files_q) = db.prepare("SELECT id, file_path FROM file_map") {
-            if let Ok(rows) = get_files_q.query_map([], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
-            }) {
-                for row in rows.flatten() {
-                    existing.insert(row.1, row.0);
+        if let Ok(db_temp) = Connection::open(&db_path) {
+            if let Ok(mut get_files_q) = db_temp.prepare("SELECT id, file_path FROM file_map") {
+                if let Ok(rows) = get_files_q.query_map([], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+                }) {
+                    for row in rows.flatten() {
+                        existing.insert(row.1, row.0);
+                    }
                 }
             }
         }
-        let max_id: i64 = db.query_row("SELECT COALESCE(MAX(id), 0) FROM file_map", [], |r| r.get(0)).unwrap_or(0);
+        let max_id: i64 = if let Ok(db_temp) = Connection::open(&db_path) {
+            db_temp.query_row("SELECT COALESCE(MAX(id), 0) FROM file_map", [], |r| r.get(0)).unwrap_or(0)
+        } else { 0 };
         let mut next_id = max_id + 1;
         for rel in &files {
             if let Some(id) = existing.get(rel) {
@@ -143,10 +176,30 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
                 next_id += 1;
             }
         }
+    }
+
+    // Open DB: temp file for full rebuild (atomic swap at end), real DB for incremental
+    let (db, is_swap) = if is_full_rebuild {
+        let temp_path = out_dir.join("phrases.tmp.sqlite");
+        let db = Connection::open(&temp_path).map_err(|e| format!("db: {}", e))?;
+        schema::create_schema(&db).map_err(|e| format!("schema: {}", e))?;
+        schema::configure_pragmas(&db).map_err(|e| format!("pragmas: {}", e))?;
+        (db, true)
+    } else {
+        let db = Connection::open(&db_path).map_err(|e| format!("db: {}", e))?;
+        schema::create_schema(&db).map_err(|e| format!("schema: {}", e))?;
+        schema::configure_pragmas(&db).map_err(|e| format!("pragmas: {}", e))?;
+        (db, false)
+    };
+
+    // Delete changed file data for incremental rebuild
+    if !is_full_rebuild {
         for (rel, _) in &changed_files {
-            if let Some(fid) = existing.get(rel) {
-                if let Ok(_) = db.execute("DELETE FROM phrase_occ WHERE file_id = ?1", [fid]) {}
-                if let Ok(_) = db.execute("DELETE FROM file_stats WHERE file_id = ?1", [fid]) {}
+            if let Ok(mut get_id) = db.prepare("SELECT id FROM file_map WHERE file_path = ?1") {
+                if let Ok(fid) = get_id.query_row(params![rel], |r| r.get::<_, i64>(0)) {
+                    if let Ok(_) = db.execute("DELETE FROM phrase_occ WHERE file_id = ?1", [fid]) {}
+                    if let Ok(_) = db.execute("DELETE FROM file_stats WHERE file_id = ?1", [fid]) {}
+                }
             }
         }
     }
@@ -166,11 +219,11 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
 
     // Parallel extraction
     let n_files = source_files.len();
-    let chunk_size = (n_files / rayon::current_num_threads().max(1)).max(1);
-    fs::write("/tmp/eh_progress.txt", format!("extraction: {} files, {} threads\n", n_files, rayon::current_num_threads())).ok();
+    let n_workers = rayon::current_num_threads();
+    let chunk_size = (n_files / n_workers.max(1)).max(1);
+    fs::write("/tmp/eh_progress.txt", format!("extraction: {} files, {} threads\n", n_files, n_workers)).ok();
 
     let repo_arc = std::sync::Arc::new(repo);
-    let file_map_arc = std::sync::Arc::new(file_map.clone());
     let file_id_map: HashMap<&str, i64> = file_map.iter().map(|(id, rel)| (rel.as_str(), *id)).collect();
     let file_id_map_arc = std::sync::Arc::new(file_id_map);
 
@@ -179,13 +232,15 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
             if chunk.is_empty() { return None; }
             let repo = repo_arc.as_path();
             let file_id_map = file_id_map_arc.as_ref();
-            let mut local_occs = FxHashMap::default();
-            let mut local_phrase_strings: HashMap<u64, String> = HashMap::new();
+            let est = chunk.len() * 80;
+            let mut local_occs: FxHashMap<(u64, i64), OccEntry> = FxHashMap::with_capacity_and_hasher(est, Default::default());
+            let mut local_phrase_strings: HashMap<u64, String> = HashMap::with_capacity(est / 4);
             let mut local_left_ctx: HashMap<String, HashMap<String, u32>> = HashMap::new();
-            let mut local_phrase_df: HashMap<u64, u32> = HashMap::new();
-            let mut local_ftl: HashMap<i64, u32> = HashMap::new();
-            let mut local_fcl: HashMap<i64, usize> = HashMap::new();
-            let mut local_fcr: HashMap<i64, f64> = HashMap::new();
+            let mut local_phrase_df: HashMap<u64, u32> = HashMap::with_capacity(est / 4);
+            let mut local_ftl: HashMap<i64, u32> = HashMap::with_capacity(chunk.len());
+            let mut local_fcl: HashMap<i64, usize> = HashMap::with_capacity(chunk.len());
+            let mut local_fcr: HashMap<i64, f64> = HashMap::with_capacity(chunk.len());
+            let mut local_digests: HashMap<String, String> = HashMap::with_capacity(chunk.len());
             let mut local_total = 0u32;
             let track_lcep = n_files <= 5000;
 
@@ -195,6 +250,12 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
                     Ok(t) => t,
                     Err(_) => continue,
                 };
+                // Compute SHA-256 during extraction — file is already in memory
+                {
+                    let mut hasher = Sha256::new();
+                    hasher.update(text.as_bytes());
+                    local_digests.insert(rel.clone(), format!("{:x}", hasher.finalize()));
+                }
                 let fid = match file_id_map.get(rel.as_str()) {
                     Some(id) => *id,
                     None => continue,
@@ -262,6 +323,7 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
                 content_lens: local_fcl,
                 comment_ratios: local_fcr,
                 total_phrases: local_total,
+                digests: local_digests,
             })
         }).collect();
 
@@ -276,6 +338,7 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
         }
         for (k, v) in wr.phrase_df { *phrase_df_counter.entry(k).or_insert(0) += v; }
         for (k, v) in wr.phrase_strings { phrase_strings.entry(k).or_insert(v); }
+        for (k, v) in wr.digests { all_digests.insert(k, v); }
         file_token_lens.extend(wr.token_lens);
         file_content_lens.extend(wr.content_lens);
         file_comment_ratios.extend(wr.comment_ratios);
@@ -296,10 +359,16 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
         {
             let mut stmt = tx.prepare("INSERT OR IGNORE INTO phrases (id, phrase) VALUES (?1, ?2)")
                 .map_err(|e| format!("prepare phrases: {}", e))?;
-            for (idx, (ph, phrase)) in phrase_list.iter().enumerate() {
-                let pid = (idx + 1) as i64;
-                stmt.execute(params![pid, phrase]).map_err(|e| format!("insert phrase: {}", e))?;
-                phrase_to_id.insert(*ph, pid);
+            let params: Vec<(i64, &String)> = phrase_list.iter().enumerate()
+                .map(|(idx, (ph, phrase))| {
+                    phrase_to_id.insert(*ph, (idx + 1) as i64);
+                    ((idx + 1) as i64, phrase)
+                }).collect();
+            let mut chunk = params.chunks(10_000);
+            while let Some(batch) = chunk.next() {
+                for (pid, phrase) in batch {
+                    stmt.execute(params![pid, phrase]).map_err(|e| format!("insert phrase: {}", e))?;
+                }
             }
             drop(stmt);
         }
@@ -329,6 +398,10 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
     });
     fs::write("/tmp/eh_progress.txt", format!("sorted {} entries, inserting phrase_occ...\n", sorted.len())).ok();
 
+    // Compute def stats in Rust (eliminate SQL uniqueness computation)
+    let mut total_def_counts: HashMap<i64, u32> = HashMap::with_capacity(file_map.len());
+    let mut unique_def_counts: HashMap<i64, u32> = HashMap::with_capacity(file_map.len());
+
     // Bulk INSERT phrase_occ with integer phrase_id
     {
         let tx = db.unchecked_transaction().map_err(|e| format!("tx: {}", e))?;
@@ -353,6 +426,15 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
                     if is_def == 0 && !lcep_thresholds.contains_key(ph) && df < 10 { is_def = -1; }
                 }
 
+                // Compute def stats during insert (no SQL needed)
+                if is_def >= 1 {
+                    let fid_key = *fid;
+                    *total_def_counts.entry(fid_key).or_insert(0) += 1;
+                    if df == 1 {
+                        *unique_def_counts.entry(fid_key).or_insert(0) += 1;
+                    }
+                }
+
                 let zi = *zone_code;
                 let line_blob = first_line.to_le_bytes().to_vec();
                 stmt.execute(rusqlite::params![pid, fid, is_def, zi, count, line_blob])
@@ -369,36 +451,22 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
     }
     fs::write("/tmp/eh_progress.txt", "phrase_occ done, stats...\n").ok();
 
-    // File stats
+    // File stats (using Rust-computed def counts, no SQL needed)
     {
         let mut stats_stmt = db.prepare(
-            "INSERT OR REPLACE INTO file_stats (file_id, token_len, content_len, comment_ratio)
-             VALUES (?1, ?2, ?3, ?4)"
+            "INSERT OR REPLACE INTO file_stats (file_id, token_len, content_len, comment_ratio, unique_def_count, total_def_count)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
         ).map_err(|e| format!("prepare stats: {}", e))?;
         for (fid, _) in &file_map {
             let tl = file_token_lens.get(fid).copied().unwrap_or(0) as f64;
             let cl = file_content_lens.get(fid).copied().unwrap_or(0) as f64;
             let cr = file_comment_ratios.get(fid).copied().unwrap_or(0.0);
-            stats_stmt.execute(params![fid, tl, cl, cr])
+            let udc = *unique_def_counts.get(fid).unwrap_or(&0);
+            let tdc = *total_def_counts.get(fid).unwrap_or(&0);
+            stats_stmt.execute(params![fid, tl, cl, cr, udc, tdc])
                 .map_err(|e| format!("stats: {}", e))?;
         }
         drop(stats_stmt);
-
-        let occ_count: i64 = db.query_row("SELECT COUNT(*) FROM phrase_occ", [], |r| r.get(0)).unwrap_or(0);
-        if occ_count < 2_000_000 {
-            db.execute_batch(
-                "CREATE TEMP TABLE phrase_df AS SELECT phrase_id, COUNT(*) AS df FROM phrase_occ GROUP BY phrase_id;
-                 UPDATE file_stats SET unique_def_count = (
-                     SELECT COUNT(*) FROM phrase_occ po
-                     JOIN phrase_df ON phrase_df.phrase_id = po.phrase_id
-                     WHERE po.file_id = file_stats.file_id AND po.is_def = 1 AND phrase_df.df = 1
-                 );
-                 UPDATE file_stats SET total_def_count = (
-                     SELECT COUNT(*) FROM phrase_occ po WHERE po.file_id = file_stats.file_id AND po.is_def = 1
-                 );
-                 DROP TABLE phrase_df;"
-            ).map_err(|e| format!("uniqueness: {}", e))?;
-        }
 
         let sum_len: u32 = file_token_lens.values().sum();
         let n_files = file_token_lens.len().max(1_usize);
@@ -419,6 +487,19 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
 
     let _ = db.close();
 
+    // Atomic swap for full rebuilds (WAL mode)
+    if is_swap {
+        let temp_path = out_dir.join("phrases.tmp.sqlite");
+        // WAL checkpoint: copy WAL into main file
+        if let Ok(chk_db) = Connection::open(&temp_path) {
+            chk_db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").ok();
+            let _ = chk_db.close();
+        }
+        // Overwrite final DB with temp DB (WAL shutdown ensures clean copy)
+        if let Ok(_) = fs::remove_file(&db_path) {}
+        if let Ok(_) = fs::rename(&temp_path, &db_path) {}
+    }
+
     if verbose {
         eprintln!("Phrase index built: {} files, {} phrases", files.len(), phrase_list.len());
     }
@@ -426,6 +507,7 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
 }
 
 fn collect_source_files(repo: &Path) -> Vec<String> {
+    use walkdir::WalkDir;
     let mut files = Vec::new();
     let skip_dirs: HashSet<&str> = [
         ".git", "node_modules", "vendor", "dist", "build", "target",
@@ -449,45 +531,34 @@ fn collect_source_files(repo: &Path) -> Vec<String> {
         ".makefile", ".dockerfile",
     ].into();
 
-    let mut stack: Vec<PathBuf> = vec![repo.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let entries = match fs::read_dir(&dir) {
+    for entry in WalkDir::new(repo)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| {
+            if let Some(name) = e.file_name().to_str() {
+                !skip_dirs.contains(name) && !name.starts_with('.')
+            } else {
+                true
+            }
+        })
+    {
+        let entry = match entry {
             Ok(e) => e,
             Err(_) => continue,
         };
-        for entry in entries.flatten() {
-            let ft = match entry.file_type() {
-                Ok(t) => t,
-                Err(_) => continue,
-            };
-            if ft.is_dir() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if skip_dirs.contains(name.as_str()) || name.starts_with('.') {
-                    continue;
-                }
-                stack.push(entry.path());
-            } else if ft.is_file() {
-                let fname = entry.file_name().to_string_lossy().to_string();
-                if lock_suffixes.contains(fname.as_str()) {
-                    continue;
-                }
-                if let Some(ext) = entry.path().extension() {
-                    let ext = format!(".{}", ext.to_string_lossy().to_lowercase());
-                    if !valid_exts.contains(ext.as_str()) {
-                        if !fname.to_lowercase().ends_with("makefile") && !fname.to_lowercase().ends_with("dockerfile") {
-                            continue;
-                        }
-                    }
-                } else {
-                    continue;
-                }
-                let p = entry.path();
-                let rel = p.strip_prefix(repo).unwrap_or(&p).to_string_lossy().to_string();
+        if !entry.file_type().is_file() { continue; }
+        let fname = entry.file_name().to_string_lossy();
+        if lock_suffixes.contains(fname.as_ref()) { continue; }
+        if let Some(ext) = entry.path().extension() {
+            let ext = format!(".{}", ext.to_string_lossy().to_lowercase());
+            if valid_exts.contains(ext.as_str()) {
+                let rel = entry.path().strip_prefix(repo).unwrap_or(entry.path()).to_string_lossy().to_string();
                 files.push(rel);
+            } else if !fname.to_lowercase().ends_with("makefile") && !fname.to_lowercase().ends_with("dockerfile") {
+                continue;
             }
         }
     }
-
     files.sort();
     files
 }

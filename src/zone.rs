@@ -1,18 +1,14 @@
-use regex::Regex;
 use std::sync::LazyLock;
 
 /// Shared regex for identifier extraction (grammar-free, 3+ char identifiers)
-pub static PHRASE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"[a-zA-Z_][a-zA-Z0-9_]{3,}").unwrap()
-});
-
-static COMMENT_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^\s*(//|#|--|%|/\*|\*)").unwrap()
+pub static PHRASE_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"[a-zA-Z_][a-zA-Z0-9_]{3,}").unwrap()
 });
 
 /// Classify a line as 'code' (0) or 'prose' (1).
 /// Grammar-free: uses structural character frequency + comment markers.
 /// Byte-based for cache efficiency: no UTF-8 decoding on ASCII source code.
+/// Uses inline byte DFA instead of regex for identifier counting (~10x faster).
 pub fn line_zone(line: &str) -> u8 {
     let s = line.trim();
     if s.is_empty() { return 1; }
@@ -41,7 +37,6 @@ pub fn line_zone(line: &str) -> u8 {
     // Structural character density using byte iteration (no UTF-8 decode)
     let mut structural = 0u32;
     let mut lower = 0u32;
-    let mut idents = 0u32;
     let slen = s.len().max(1) as f64;
 
     for &b in bytes {
@@ -54,8 +49,22 @@ pub fn line_zone(line: &str) -> u8 {
         }
     }
 
-    // Approximate ident count via PHRASE_RE (still needed for accuracy)
-    idents = PHRASE_RE.find_iter(s).count() as u32;
+    // Count identifiers using inline byte DFA (~10x faster than regex)
+    let mut idents = 0u32;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
+            let mut count = 1u32;
+            i += 1;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+                count += 1;
+            }
+            if count >= 4 { idents += 1; }
+        } else {
+            i += 1;
+        }
+    }
 
     if slen > 0.0 {
         let prose_ratio = lower as f64 / slen;

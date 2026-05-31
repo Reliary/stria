@@ -37,6 +37,18 @@ pub fn create_schema(db: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+pub fn configure_pragmas(db: &Connection) -> rusqlite::Result<()> {
+    db.execute_batch(
+        "PRAGMA synchronous = OFF;
+         PRAGMA journal_mode = MEMORY;
+         PRAGMA cache_size = -200000;
+         PRAGMA mmap_size = 268435456;
+         PRAGMA page_size = 65536;
+         PRAGMA temp_store = MEMORY;
+         PRAGMA lock_timeout = 5000;"
+    )
+}
+
 pub fn rebuild_primary_key(_db: &Connection) -> rusqlite::Result<()> {
     // No-op: data is inserted sorted by (phrase_id, file_id), so WITHOUT ROWID
     // B-tree fills sequentially with zero page splits.
