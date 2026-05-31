@@ -131,7 +131,7 @@ pub fn search_phrases(
     let mut file_scores: HashMap<i64, f64> = HashMap::new();
     let mut file_line_sets: HashMap<i64, HashMap<String, Vec<i32>>> = HashMap::new();
     let mut file_tiers: HashMap<i64, u8> = HashMap::new();
-    let mut file_phrases_matched: HashMap<i64, u32> = HashMap::new();
+    let mut file_idf_sum: HashMap<i64, f64> = HashMap::new();
 
     // Tier 1: Exact match BM25
     for st in &search_terms {
@@ -177,7 +177,7 @@ pub fn search_phrases(
             let comment_mult = (1.0 - comment_ratio * 0.5).max(0.5);
             *file_scores.entry(fid).or_insert(0.0) += score * zone_mult * def_mult * uniq_mult * comment_mult;
             file_tiers.entry(fid).or_insert(0);
-            *file_phrases_matched.entry(fid).or_insert(0) += 1;
+            *file_idf_sum.entry(fid).or_insert(0.0) += idf;
             if first_line > 0 {
                 file_line_sets.entry(fid).or_default()
                     .entry(st.clone()).or_default()
@@ -226,7 +226,7 @@ pub fn search_phrases(
             let contrib = score * zone_mult * def_mult * uniq_mult * comment_mult * idf_rare;
             *file_scores.entry(fid).or_insert(0.0) += contrib;
             file_tiers.entry(fid).or_insert(1);
-            *file_phrases_matched.entry(fid).or_insert(0) += 1;
+            *file_idf_sum.entry(fid).or_insert(0.0) += idf;
         }
     }
 
@@ -268,17 +268,19 @@ pub fn search_phrases(
             let contrib = score * zone_mult * def_mult * comment_mult * idf_rare;
             *file_scores.entry(fid).or_insert(0.0) += contrib;
             file_tiers.entry(fid).or_insert(2);
-            *file_phrases_matched.entry(fid).or_insert(0) += 1;
+            *file_idf_sum.entry(fid).or_insert(0.0) += idf;
         }
     }
 
-    // Concentration bonus: files matching more distinct query terms get a boost.
-    // A file matching 2/2 terms outranks one matching 1/2 even if the TF is higher.
-    let total_search_terms = search_terms.len() as f64;
-    if total_search_terms > 1.0 {
+    // Concentration bonus: files matching high-IDF terms get a boost.
+    // Low-IDF terms (like 'test' appearing in 50%+ of files) contribute less.
+    let total_idf_sum: f64 = search_terms.iter()
+        .filter_map(|st| idf_map.get(st.as_str()))
+        .sum();
+    if total_idf_sum > 0.0 && search_terms.len() > 1 {
         for (fid, score) in file_scores.iter_mut() {
-            let matched = file_phrases_matched.get(fid).copied().unwrap_or(0) as f64;
-            let concentration = (matched.min(total_search_terms)) / total_search_terms;
+            let matched_sum = file_idf_sum.get(fid).copied().unwrap_or(0.0);
+            let concentration = (matched_sum.min(total_idf_sum)) / total_idf_sum;
             *score *= 1.0 + concentration * concentration;
         }
     }
