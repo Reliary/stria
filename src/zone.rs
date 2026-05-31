@@ -88,6 +88,7 @@ pub fn line_zone(line: &str) -> u8 {
 
 /// Grammar-free definition detection: checks if phrase is followed by `(`, `<`, `[`, `=`, `:`.
 /// Uses byte operations and the known match position — no `find()` scan, no UTF-8 decode.
+/// Scans forward past word characters to catch type declarations like `struct {`, `interface {`.
 pub fn is_definition(phrase: &str, line: &str, match_start: usize) -> bool {
     let bytes = line.as_bytes();
     let end = match_start + phrase.len();
@@ -101,11 +102,19 @@ pub fn is_definition(phrase: &str, line: &str, match_start: usize) -> bool {
         }
     }
 
-    // First non-whitespace char after the phrase
-    let after_slice = &bytes[end..];
-    let first_non_space = after_slice.iter().position(|&b| b != b' ' && b != b'\t');
-    let pos = first_non_space.map(|p| end + p).unwrap_or(bytes.len());
-
+    // Scan forward: skip whitespace, then word characters (reserved words like struct/extends),
+    // then check for structural definition marker.
+    // Catches: type Foo struct { | class Foo extends Bar { | trait Foo where Self:
+    let mut pos = end;
+    while pos < bytes.len() && (bytes[pos] == b' ' || bytes[pos] == b'\t') {
+        pos += 1;
+    }
+    while pos < bytes.len() && (bytes[pos].is_ascii_alphanumeric() || bytes[pos] == b'_') {
+        pos += 1;
+    }
+    while pos < bytes.len() && (bytes[pos] == b' ' || bytes[pos] == b'\t') {
+        pos += 1;
+    }
     if pos < bytes.len() {
         let c = bytes[pos];
         if matches!(c, b'(' | b'<' | b'[' | b'=' | b':' | b'{') { return true; }

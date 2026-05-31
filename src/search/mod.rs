@@ -104,6 +104,17 @@ pub fn search_phrases(
             let s = tl[..tl.len()-4].to_string();
             if !search_terms.contains(&s) { search_terms.push(s); }
         }
+        // Expand underscore-delimited: "hub_risk_report" → sub-words + adjacent pairs
+        if tl.contains('_') || tl.contains('-') {
+            let sub: Vec<&str> = tl.split(|c| c == '_' || c == '-').filter(|s| s.len() >= 3).collect();
+            for s in &sub {
+                if !search_terms.iter().any(|x| x == s) { search_terms.push(s.to_string()); }
+            }
+            for pair in sub.windows(2) {
+                let joined = format!("{}_{}", pair[0], pair[1]);
+                if joined.len() >= 4 && !search_terms.contains(&joined) { search_terms.push(joined); }
+            }
+        }
     }
 
     // Pre-compute IDF — all queries go through phrases table JOIN
@@ -261,13 +272,14 @@ pub fn search_phrases(
         }
     }
 
-    // Concentration bonus
+    // Concentration bonus: files matching more distinct query terms get a boost.
+    // A file matching 2/2 terms outranks one matching 1/2 even if the TF is higher.
     let total_search_terms = search_terms.len() as f64;
     if total_search_terms > 1.0 {
         for (fid, score) in file_scores.iter_mut() {
             let matched = file_phrases_matched.get(fid).copied().unwrap_or(0) as f64;
             let concentration = (matched.min(total_search_terms)) / total_search_terms;
-            *score *= 1.0 + concentration * 0.5;
+            *score *= 1.0 + concentration * concentration;
         }
     }
 

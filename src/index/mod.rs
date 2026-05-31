@@ -422,8 +422,6 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
                 if df < 20 && *entropy < 1.0 { is_def = 2; }
                 else if df < 20 && *entropy < 2.0 { is_def = is_def.max(1); }
                 else if df >= 20 && *entropy > 2.5 { is_def = 0; }
-            } else if df < 10 {
-                is_def = -1;
             }
         }
         if is_def >= 1 {
@@ -452,7 +450,7 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
                     if df < 20 && *entropy < 1.0 { is_def = 2; }
                     else if df < 20 && *entropy < 2.0 { is_def = is_def.max(1); }
                     else if df >= 20 && *entropy > 2.5 { is_def = 0; }
-                } else if df < 10 { is_def = -1; }
+                }
             }
             if is_def >= 1 {
                 *total_def_counts.entry(*fid).or_insert(0) += 1;
