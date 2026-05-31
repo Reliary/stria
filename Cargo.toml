@@ -2,6 +2,12 @@
 name = "stria"
 version = "0.1.0"
 edition = "2021"
+description = "Grammar-free structural codebase indexer and MCP server"
+license = "MIT"
+repository = "https://github.com/Reliary/stria"
+homepage = "https://github.com/Reliary/stria"
+keywords = ["mcp", "code-intelligence", "structural-analysis", "grammar-free", "codebase-indexing"]
+categories = ["development-tools", "command-line-utilities"]
 
 [dependencies]
 clap = { version = "4.6.1", features = ["derive"] }
