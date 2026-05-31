@@ -12,6 +12,29 @@ stria serve --repo .
 
 That builds the index on first run (no separate `init` step), then starts an MCP server on stdin/stdout. Point your agent at it.
 
+## Agent onboarding
+
+Add the MCP server to your agent's config. For OpenCode (`~/.config/opencode/opencode.json`):
+
+```json
+"stria": {
+  "type": "local",
+  "command": ["stria", "serve", "--repo", "/path/to/your/repo"]
+}
+```
+
+Claude Code, Cursor, and other MCP-compatible agents use similar local-server entries.
+
+When the agent starts a session, it calls `orient` first. The response includes the repo's language breakdown, a tool guide with `use_when` hints for each tool, and workflow suggestions. Then:
+
+1. **`code_search(task="...")`** to find the right file, its test, and risk. Default tier paths are compact. Add `expand_plan` for blast radius and coupled files.
+
+2. **`who_calls(name="...")`** before refactoring a function or type to find every file that references it.
+
+3. **`hidden_deps(file="...")`** to check whether a change reaches outside the current module.
+
+Each tool returns JSON. The agent reads it directly -- no prose to parse.
+
 ## What it solves
 
 Most code understanding tools need a parser (works for popular languages, breaks on everything else) or a full context dump (thousands of tokens per query). stria reads source files as raw text, splits on delimiters, and builds an inverted phrase-to-file index in seconds. No AST, no grammar files, no per-language configuration.
