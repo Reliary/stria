@@ -1,6 +1,30 @@
 use rusqlite::Connection;
 
-pub fn create_schema(db: &Connection) -> rusqlite::Result<()> {
+pub fn create_new_db(db: &Connection) -> rusqlite::Result<()> {
+    // page_size must be set BEFORE any table creation
+    db.execute_batch(
+        "PRAGMA synchronous = OFF;
+         PRAGMA journal_mode = MEMORY;
+         PRAGMA cache_size = -200000;
+         PRAGMA mmap_size = 268435456;
+         PRAGMA temp_store = MEMORY;
+         PRAGMA lock_timeout = 5000;"
+    )?;
+    create_tables(db)
+}
+
+pub fn open_existing_db(db: &Connection) -> rusqlite::Result<()> {
+    db.execute_batch(
+        "PRAGMA synchronous = OFF;
+         PRAGMA journal_mode = MEMORY;
+         PRAGMA cache_size = -200000;
+         PRAGMA mmap_size = 268435456;
+         PRAGMA temp_store = MEMORY;
+         PRAGMA lock_timeout = 5000;"
+    )
+}
+
+fn create_tables(db: &Connection) -> rusqlite::Result<()> {
     db.execute_batch(
         "CREATE TABLE IF NOT EXISTS file_map (
             id INTEGER PRIMARY KEY,
@@ -37,20 +61,6 @@ pub fn create_schema(db: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-pub fn configure_pragmas(db: &Connection) -> rusqlite::Result<()> {
-    db.execute_batch(
-        "PRAGMA synchronous = OFF;
-         PRAGMA journal_mode = MEMORY;
-         PRAGMA cache_size = -200000;
-         PRAGMA mmap_size = 268435456;
-         PRAGMA page_size = 65536;
-         PRAGMA temp_store = MEMORY;
-         PRAGMA lock_timeout = 5000;"
-    )
-}
-
 pub fn rebuild_primary_key(_db: &Connection) -> rusqlite::Result<()> {
-    // No-op: data is inserted sorted by (phrase_id, file_id), so WITHOUT ROWID
-    // B-tree fills sequentially with zero page splits.
     Ok(())
 }

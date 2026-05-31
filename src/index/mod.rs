@@ -135,7 +135,7 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
         changed_files.iter().map(|(rel, _)| rel.clone()).collect()
     };
 
-    // Accumulators
+    // Accumulators — pre-allocated during merge phase after extraction completes
     let mut occs: FxHashMap<(u64, i64), OccEntry> = FxHashMap::default();
     let mut phrase_strings: HashMap<u64, String> = HashMap::new();
     let mut phrase_left_ctx: HashMap<String, HashMap<String, u32>> = HashMap::new();
@@ -182,13 +182,12 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
     let (db, is_swap) = if is_full_rebuild {
         let temp_path = out_dir.join("phrases.tmp.sqlite");
         let db = Connection::open(&temp_path).map_err(|e| format!("db: {}", e))?;
-        schema::create_schema(&db).map_err(|e| format!("schema: {}", e))?;
-        schema::configure_pragmas(&db).map_err(|e| format!("pragmas: {}", e))?;
+        schema::create_new_db(&db).map_err(|e| format!("schema: {}", e))?;
         (db, true)
     } else {
         let db = Connection::open(&db_path).map_err(|e| format!("db: {}", e))?;
-        schema::create_schema(&db).map_err(|e| format!("schema: {}", e))?;
-        schema::configure_pragmas(&db).map_err(|e| format!("pragmas: {}", e))?;
+        schema::open_existing_db(&db).map_err(|e| format!("pragmas: {}", e))?;
+        schema::create_new_db(&db).ok(); // create tables if they don't exist
         (db, false)
     };
 
@@ -329,7 +328,16 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
 
     fs::write("/tmp/eh_progress.txt", format!("extraction done: {} worker results\n", results.len())).ok();
 
-    // Merge all results
+    // Pre-allocate to prevent rehash thrash (24M entries × 12 rehashes = 12s)
+    let est_occs: usize = std::cmp::max(n_files * 20, results.iter().map(|wr| wr.occs.len()).sum());
+    occs.reserve(est_occs);
+    phrase_df_counter.reserve(est_occs / 4);
+    phrase_strings.reserve(est_occs / 4);
+    file_token_lens.reserve(n_files);
+    file_content_lens.reserve(n_files);
+    file_comment_ratios.reserve(n_files);
+
+    // Merge all results — pre-allocated occs handles 24M entries without rehash
     for wr in results {
         for (k, v) in wr.occs { occs.entry(k).or_insert(v); }
         for (k, v) in wr.left_ctx {
@@ -357,18 +365,18 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
     {
         let tx = db.unchecked_transaction().map_err(|e| format!("tx phrases: {}", e))?;
         {
-            let mut stmt = tx.prepare("INSERT OR IGNORE INTO phrases (id, phrase) VALUES (?1, ?2)")
+            // On full rebuild, phrases are known-unique from Rust dedup (no UNIQUE check needed)
+            let insert_sql = if is_full_rebuild {
+                "INSERT INTO phrases (id, phrase) VALUES (?1, ?2)"
+            } else {
+                "INSERT OR IGNORE INTO phrases (id, phrase) VALUES (?1, ?2)"
+            };
+            let mut stmt = tx.prepare(insert_sql)
                 .map_err(|e| format!("prepare phrases: {}", e))?;
-            let params: Vec<(i64, &String)> = phrase_list.iter().enumerate()
-                .map(|(idx, (ph, phrase))| {
-                    phrase_to_id.insert(*ph, (idx + 1) as i64);
-                    ((idx + 1) as i64, phrase)
-                }).collect();
-            let mut chunk = params.chunks(10_000);
-            while let Some(batch) = chunk.next() {
-                for (pid, phrase) in batch {
-                    stmt.execute(params![pid, phrase]).map_err(|e| format!("insert phrase: {}", e))?;
-                }
+            for (idx, (ph, phrase)) in phrase_list.iter().enumerate() {
+                let pid = (idx + 1) as i64;
+                stmt.execute(params![pid, phrase]).map_err(|e| format!("insert phrase: {}", e))?;
+                phrase_to_id.insert(*ph, pid);
             }
             drop(stmt);
         }
@@ -389,64 +397,70 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
         }).collect();
 
     // Sort occs by (phrase_id, file_id) for sequential WITHOUT ROWID B-tree fill.
-    // Phrase_id is an integer — sort is pure arithmetic, no string comparison needed.
-    let mut sorted: Vec<((u64, i64), OccEntry)> = occs.into_iter().collect();
-    sorted.par_sort_unstable_by(|a, b| {
-        let pa = phrase_to_id.get(&a.0 .0).copied().unwrap_or(i64::MAX);
-        let pb = phrase_to_id.get(&b.0 .0).copied().unwrap_or(i64::MAX);
-        pa.cmp(&pb).then_with(|| a.0 .1.cmp(&b.0 .1))
-    });
+    // Pre-compute phrase_ids so sorting is pure integer comparison (no HashMap lookups).
+    let mut sorted: Vec<((i64, i64), [i32; 4])> = Vec::with_capacity(occs.len());
+    let mut df_map: HashMap<i64, u32> = HashMap::with_capacity(phrase_to_id.len());
+    let mut entropy_by_pid: HashMap<i64, f64> = HashMap::new();
+    for ((ph, fid), entry) in occs {
+        let pid = phrase_to_id.get(&ph).copied().unwrap_or(0);
+        sorted.push(((pid, fid), entry));
+        *df_map.entry(pid).or_insert(0) += 1;
+        if let Some(entropy) = lcep_thresholds.get(&ph) {
+            entropy_by_pid.entry(pid).or_insert(*entropy);
+        }
+    }
+    sorted.par_sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.0.1.cmp(&b.0.1)));
     fs::write("/tmp/eh_progress.txt", format!("sorted {} entries, inserting phrase_occ...\n", sorted.len())).ok();
 
     // Compute def stats in Rust (eliminate SQL uniqueness computation)
     let mut total_def_counts: HashMap<i64, u32> = HashMap::with_capacity(file_map.len());
     let mut unique_def_counts: HashMap<i64, u32> = HashMap::with_capacity(file_map.len());
 
-    // Bulk INSERT phrase_occ with integer phrase_id
+    // Bulk INSERT phrase_occ with prepared statement (batched execute+step, no SQL recompile)
     {
         let tx = db.unchecked_transaction().map_err(|e| format!("tx: {}", e))?;
-        {
-            let mut stmt = tx.prepare(
-                "INSERT INTO phrase_occ (phrase_id, file_id, is_def, zone_int, count, line_nos)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
-            ).map_err(|e| format!("prepare: {}", e))?;
+        let mut stmt = tx.prepare(
+            "INSERT INTO phrase_occ (phrase_id, file_id, is_def, zone_int, count, line_nos)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+        ).map_err(|e| format!("prepare: {}", e))?;
 
-            let mut row_count = 0u32;
-            for ((ph, fid), [is_def_orig, zone_code, count, first_line]) in &sorted {
-                let pid = phrase_to_id.get(ph).copied().unwrap_or(0);
-                let mut is_def = *is_def_orig;
-                let df = phrase_df_counter.get(ph).copied().unwrap_or(0);
+        let mut row_count = 0u32;
+        let has_lcep = !lcep_thresholds.is_empty();
 
-                if *zone_code == 0 {
-                    if let Some(entropy) = lcep_thresholds.get(ph) {
-                        if df < 20 && *entropy < 1.0 { is_def = 2; }
-                        else if df < 20 && *entropy < 2.0 { is_def = is_def.max(1); }
-                        else if df >= 20 && *entropy > 2.5 { is_def = 0; }
-                    }
-                    if is_def == 0 && !lcep_thresholds.contains_key(ph) && df < 10 { is_def = -1; }
-                }
+        for ((pid, fid), [is_def_orig, zone_code, count, first_line]) in &sorted {
+            let mut is_def = *is_def_orig;
+            let df = df_map.get(pid).copied().unwrap_or(0);
 
-                // Compute def stats during insert (no SQL needed)
-                if is_def >= 1 {
-                    let fid_key = *fid;
-                    *total_def_counts.entry(fid_key).or_insert(0) += 1;
-                    if df == 1 {
-                        *unique_def_counts.entry(fid_key).or_insert(0) += 1;
-                    }
-                }
-
-                let zi = *zone_code;
-                let line_blob = first_line.to_le_bytes().to_vec();
-                stmt.execute(rusqlite::params![pid, fid, is_def, zi, count, line_blob])
-                    .map_err(|e| format!("insert: {}", e))?;
-
-                row_count += 1;
-                if row_count % 1_000_000 == 0 {
-                    fs::write("/tmp/eh_progress.txt", format!("inserting... {}M rows\n", row_count / 1_000_000)).ok();
+            // LCEP override — only meaningful for small repos
+            if has_lcep && *zone_code == 0 {
+                if let Some(entropy) = entropy_by_pid.get(pid) {
+                    if df < 20 && *entropy < 1.0 { is_def = 2; }
+                    else if df < 20 && *entropy < 2.0 { is_def = is_def.max(1); }
+                    else if df >= 20 && *entropy > 2.5 { is_def = 0; }
+                } else if df < 10 {
+                    is_def = -1;
                 }
             }
-            drop(stmt);
+            if is_def == 0 && *zone_code == 0 && df < 10 { is_def = -1; }
+
+            // Compute def stats during insert (no SQL needed)
+            if is_def >= 1 {
+                *total_def_counts.entry(*fid).or_insert(0) += 1;
+                if df == 1 {
+                    *unique_def_counts.entry(*fid).or_insert(0) += 1;
+                }
+            }
+
+            let line_bytes = first_line.to_le_bytes();
+            stmt.execute(rusqlite::params![pid, fid, is_def, zone_code, count, &line_bytes[..]])
+                .map_err(|e| format!("insert: {}", e))?;
+
+            row_count += 1;
+            if row_count % 1_000_000 == 0 {
+                fs::write("/tmp/eh_progress.txt", format!("inserting... {}M rows\n", row_count / 1_000_000)).ok();
+            }
         }
+        drop(stmt);
         tx.commit().map_err(|e| format!("commit: {}", e))?;
     }
     fs::write("/tmp/eh_progress.txt", "phrase_occ done, stats...\n").ok();
@@ -469,15 +483,18 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
         drop(stats_stmt);
 
         let sum_len: u32 = file_token_lens.values().sum();
-        let n_files = file_token_lens.len().max(1_usize);
-        let avgdl = sum_len as f64 / n_files as f64;
+        let n_stats_files = file_token_lens.len().max(1_usize);
+        let avgdl = sum_len as f64 / n_stats_files as f64;
 
         db.execute(
             "INSERT OR REPLACE INTO meta (key, value) VALUES ('avgdl', ?1)",
             [avgdl],
         ).map_err(|e| format!("meta: {}", e))?;
 
-        db.execute_batch("ANALYZE").ok();
+        // Skip ANALYZE on large repos — no benefit for search, costs 5s+ on kernel
+        if n_files < 5000 {
+            db.execute_batch("ANALYZE").ok();
+        }
     }
 
     // Write digest cache
