@@ -153,6 +153,30 @@ def main():
         test("rapid-fire no crash", lambda: (
             [tool("health") for _ in range(10)] and None
         ))
+
+        # T15: switch_repo changes the active repo
+        test("switch_repo changes repo", lambda: (
+            lambda r: (
+                None if r.get("status") == "ok"
+                else (_ for _ in ()).throw(AssertionError(f"switch_repo failed: {r}"))
+            )
+        )(tool("switch_repo", {"path": REPO})))
+
+        # T16: orient after switch_repo shows different repo
+        test("orient after switch_repo", lambda: (
+            lambda r: (
+                None if r.get("n_files", 0) > 0
+                else (_ for _ in ()).throw(AssertionError(f"bad orient: {r}"))
+            )
+        )(tool("orient")))
+
+        # T17: switch_repo with bad path returns error
+        test("switch_repo bad path", lambda: (
+            lambda r: (
+                None if r.get("error") and "Path not found" in r["error"]
+                else (_ for _ in ()).throw(AssertionError(f"expected error: {r}"))
+            )
+        )(tool("switch_repo", {"path": "/nonexistent/path"})))
         
     finally:
         proc.terminate()

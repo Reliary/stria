@@ -4,6 +4,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 pub mod index;
 pub mod lcep;
 pub mod search;
+pub mod setup;
 pub mod structural_risk;
 pub mod zone;
 
@@ -43,6 +44,16 @@ enum Commands {
     Watch {
         #[arg(long)]
         repo: String,
+    },
+    /// Detect agents and add stria MCP server entry
+    Setup {
+        #[arg(long, default_value = "false")]
+        yes: bool,
+    },
+    /// Remove stria from agent configurations
+    Remove {
+        #[arg(long, default_value = "false")]
+        yes: bool,
     },
 }
 
@@ -94,7 +105,7 @@ fn main() {
                 "stria MCP server starting for repo: {}",
                 canonical.display()
             );
-            mcp_server(canonical.to_str().unwrap_or(&repo));
+            mcp_server(canonical.to_str().unwrap_or(&repo).to_string());
         }
         Commands::Watch { repo } => {
             let repo_path = Path::new(&repo);
@@ -120,20 +131,27 @@ fn main() {
                 eprintln!("Watch error: {}", e);
             }
         }
+        Commands::Setup { yes } => {
+            setup::run_setup(yes);
+        }
+        Commands::Remove { yes } => {
+            setup::run_remove(yes);
+        }
     }
 }
 
-fn mcp_server(repo_path: &str) {
+fn mcp_server(initial_repo: String) {
     use serde_json::{json, Value};
     use std::io::{self, BufRead, Write};
+    use std::sync::Mutex;
 
-    let db_path = std::path::Path::new(repo_path)
-        .join(".horizon")
-        .join("phrases.sqlite")
-        .to_str()
-        .unwrap_or("")
-        .to_string();
-    let mut _initialized = false;
+    let current_repo: Mutex<String> = Mutex::new(initial_repo);
+
+    let db_path_of = |repo: &str| -> String {
+        std::path::Path::new(repo)
+            .join(".horizon").join("phrases.sqlite")
+            .to_str().unwrap_or("").to_string()
+    };
 
     let tools = json!([
         {"name": "orient", "description": "One-time session orientation. Returns tool workflow map + language breakdown. Call this first. ~80t.", "inputSchema": {"type": "object", "properties": {}, "required": []}},
@@ -146,6 +164,7 @@ fn mcp_server(repo_path: &str) {
         {"name": "expand_body", "description": "Expand a [HORIZON: hash] marker to full function body. Use when: orient output shows an horizon marker and you need to read the function source. Input: the hex hash from the marker.", "inputSchema": {"type": "object", "properties": {"hash": {"type": "string"}}, "required": ["hash"]}},
         {"name": "find_hash", "description": "Find horizon hashes by function name. Use when: you know a function name and need its hash for expand_body. Input: function name or partial name.", "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}},
         {"name": "health", "description": "Server health check. Returns DB stats and latency. Use when: connection issues or monitoring.", "inputSchema": {"type": "object", "properties": {}, "required": []}},
+        {"name": "switch_repo", "description": "Switch the active repo and rebuild index if needed. Use when: working on multiple projects in one agent session. Input: path to the repo root.", "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}},
     ]);
 
     for line in io::stdin().lock().lines() {
@@ -167,7 +186,6 @@ fn mcp_server(repo_path: &str) {
 
         let response = match method {
             "initialize" => {
-                _initialized = true;
                 json!({
                     "jsonrpc": "2.0",
                     "id": req_id,
@@ -183,6 +201,8 @@ fn mcp_server(repo_path: &str) {
                 json!({"jsonrpc": "2.0", "id": req_id, "result": {"tools": tools}})
             }
             "tools/call" => {
+                let repo = current_repo.lock().unwrap().clone();
+                let db_path = db_path_of(&repo);
                 let name = request
                     .pointer("/params/name")
                     .and_then(|n| n.as_str())
@@ -386,7 +406,7 @@ fn mcp_server(repo_path: &str) {
                             .pointer("/params/arguments/hash")
                             .and_then(|h| h.as_str())
                             .unwrap_or("");
-                        let mut body = get_horizon_body(repo_path, hash);
+                        let mut body = get_horizon_body(&repo, hash);
                         if body.len() > 51200 {
                             body.truncate(51200);
                             body.push_str("\n// [body truncated at 50KB]");
@@ -398,7 +418,7 @@ fn mcp_server(repo_path: &str) {
                             .pointer("/params/arguments/name")
                             .and_then(|n| n.as_str())
                             .unwrap_or("");
-                        let horizon_db = std::path::Path::new(repo_path)
+                        let horizon_db = std::path::Path::new(&repo)
                             .join(".horizon")
                             .join("horizon.db")
                             .to_str()
@@ -520,6 +540,33 @@ fn mcp_server(repo_path: &str) {
                             "build_time_readable": build_date,
                             "ms": ms,
                         })
+                    }
+                    "switch_repo" => {
+                        let new_path = request
+                            .pointer("/params/arguments/path")
+                            .and_then(|p| p.as_str())
+                            .unwrap_or("");
+                        let canonical = match std::path::Path::new(new_path).canonicalize() {
+                            Ok(p) => p.to_string_lossy().to_string(),
+                            Err(_) => String::new(),
+                        };
+                        if canonical.is_empty() {
+                            json!({"error": format!("Path not found: {}", new_path)})
+                        } else {
+                            let out_dir = std::path::Path::new(&canonical).join(".horizon");
+                            if !out_dir.join("phrases.sqlite").exists() {
+                                match index::build_phrase_index(&canonical, &out_dir, false) {
+                                    Ok(n) => {
+                                        *current_repo.lock().unwrap() = canonical;
+                                        json!({"status": "ok", "phrases": n})
+                                    }
+                                    Err(e) => json!({"error": format!("Index build failed: {}", e)})
+                                }
+                            } else {
+                                *current_repo.lock().unwrap() = canonical;
+                                json!({"status": "ok"})
+                            }
+                        }
                     }
                     _ => {
                         json!({"error": format!("Unknown tool: {}", name)})
