@@ -83,15 +83,22 @@ fn main() {
 
 fn mcp_server(repo_path: &str) {
     use std::io::{self, BufRead, Write};
-    use serde_json::Value;
+    use serde_json::{json, Value};
 
     let db_path = format!("{}/.horizon/phrases.sqlite", repo_path);
+    let mut initialized = false;
+
+    let tools = json!([
+        {"name": "holo_search", "description": "Search phrase index for code locations", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}},
+        {"name": "cross_horizon", "description": "Expand [HORIZON: hash] to full function body", "inputSchema": {"type": "object", "properties": {"hash": {"type": "string"}}, "required": ["hash"]}},
+        {"name": "search_horizon", "description": "Find horizon hashes by function name", "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}},
+        {"name": "hologram_plan", "description": "Structural execution plan with risk and verify candidates", "inputSchema": {"type": "object", "properties": {"task": {"type": "string"}}, "required": ["task"]}},
+        {"name": "who_calls", "description": "Find callers of an identifier", "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}},
+        {"name": "latent_deps", "description": "Find hidden cross-module dependencies", "inputSchema": {"type": "object", "properties": {"file": {"type": "string"}}, "required": ["file"]}},
+    ]);
 
     for line in io::stdin().lock().lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => break,
-        };
+        let line = match line { Ok(l) => l, Err(_) => break };
         if line.trim().is_empty() { continue; }
 
         let request: Value = match serde_json::from_str(&line) {
@@ -99,91 +106,96 @@ fn mcp_server(repo_path: &str) {
             Err(_) => continue,
         };
 
+        let req_id = request.get("id");
         let method = request.get("method").and_then(|m| m.as_str()).unwrap_or("");
-        let id = request.get("id");
 
         let response = match method {
-            "cross_horizon" => {
-                let hash = request.pointer("/params/hash")
-                    .and_then(|h| h.as_str()).unwrap_or("");
-                let body = get_horizon_body(repo_path, hash);
-                make_result(id, &serde_json::json!({"body": body}))
+            "initialize" => {
+                initialized = true;
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "result": {
+                        "protocolVersion": "2024-11-05",
+                        "capabilities": {"tools": {}},
+                        "serverInfo": {"name": "event-horizon", "version": "0.3.0"}
+                    }
+                })
             }
-            "search_horizon" => {
-                let name = request.pointer("/params/name")
-                    .and_then(|n| n.as_str()).unwrap_or("");
-                let results = if let Ok(c) = rusqlite::Connection::open(
-                    &format!("{}/.horizon/horizon.db", repo_path)
-                ) {
-                    let mut stmt = c.prepare(
-                        "SELECT hash, name FROM functions WHERE name LIKE ?1 LIMIT 20"
-                    ).unwrap();
-                    let rows = stmt.query_map([&format!("%{}%", name)], |r| {
-                        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-                    }).unwrap();
-                    rows.filter_map(|r| r.ok()).collect::<Vec<_>>()
-                } else { vec![] };
-                make_result(id, &serde_json::json!({"results": results}))
+            "notifications/initialized" => continue,
+            "tools/list" => {
+                json!({"jsonrpc": "2.0", "id": req_id, "result": {"tools": tools}})
             }
-            "hologram_query" | "holo_search" => {
-                let task = request.pointer("/params/task")
-                    .or_else(|| request.pointer("/params/query"))
-                    .and_then(|t| t.as_str()).unwrap_or("");
-                let results = search::search_phrases(&db_path, task, 10);
-                let files: Vec<serde_json::Value> = results.iter().map(|(fp, sc)| {
-                    serde_json::json!({"file": fp, "score": sc})
-                }).collect();
-                make_result(id, &serde_json::json!({"candidates": files}))
-            }
-            "hologram_expand" => {
-                let task = request.pointer("/params/task")
-                    .and_then(|t| t.as_str()).unwrap_or("");
-                let search_results = search::search_phrases(&db_path, task, 5);
-                let top_file = search_results.first().map(|(fp, _)| fp.clone()).unwrap_or_default();
-                let plan = structural_risk::hologram_plan(&db_path, task);
-                // Get horizon body for the top file
-                let body = if !top_file.is_empty() {
-                    get_horizon_body_for_file(repo_path, &top_file)
-                } else { String::new() };
-                make_result(id, &serde_json::json!({
-                    "task": task,
-                    "top_edit": search_results.first().map(|(fp, sc)| (fp, sc)),
-                    "plan": plan,
-                    "body_excerpt": body.chars().take(500).collect::<String>()
-                }))
-            }
-            "hologram_watch" => {
-                // Background watcher: spawn a thread that polls mtime and rebuilds
-                // For MCP, we just acknowledge and log
-                eprintln!("hologram_watch started for: {}", repo_path);
-                make_result(id, &serde_json::json!({"status": "watching", "repo": repo_path}))
-            }
-            "who_calls" => {
-                let name = request.pointer("/params/name")
-                    .and_then(|n| n.as_str()).unwrap_or("");
-                let results = structural_risk::who_calls(&db_path, name);
-                make_result(id, &serde_json::json!({"callers": results}))
-            }
-            "latent_deps" => {
-                let file = request.pointer("/params/file")
-                    .and_then(|f| f.as_str()).unwrap_or("");
-                let results = structural_risk::latent_deps(&db_path, file);
-                make_result(id, &serde_json::json!({"deps": results}))
-            }
-            "switch_repo" => {
-                let new_repo = request.pointer("/params/repo")
-                    .and_then(|r| r.as_str()).unwrap_or("");
-                eprintln!("Switching repo to: {}", new_repo);
-                make_result(id, &serde_json::json!({"ok": true, "repo": new_repo}))
-            }
-            "hologram_plan" => {
-                let task = request.pointer("/params/task")
-                    .and_then(|t| t.as_str()).unwrap_or("");
-                let plan = structural_risk::hologram_plan(&db_path, task);
-                make_result(id, &plan)
+            "tools/call" => {
+                let name = request.pointer("/params/name").and_then(|n| n.as_str()).unwrap_or("");
+                let result = match name {
+                    "cross_horizon" => {
+                        let hash = request.pointer("/params/arguments/hash")
+                            .and_then(|h| h.as_str()).unwrap_or("");
+                        let body = get_horizon_body(repo_path, hash);
+                        json!({"body": body})
+                    }
+                    "search_horizon" => {
+                        let search_name = request.pointer("/params/arguments/name")
+                            .and_then(|n| n.as_str()).unwrap_or("");
+                        let results = if let Ok(c) = rusqlite::Connection::open(
+                            &format!("{}/.horizon/horizon.db", repo_path)
+                        ) {
+                            let mut stmt = c.prepare(
+                                "SELECT hash, name FROM functions WHERE name LIKE ?1 LIMIT 20"
+                            ).unwrap();
+                            let rows = stmt.query_map([&format!("%{}%", search_name)], |r| {
+                                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                            }).unwrap();
+                            rows.filter_map(|r| r.ok()).collect::<Vec<_>>()
+                        } else { vec![] };
+                        json!({"results": results})
+                    }
+                    "holo_search" => {
+                        let query = request.pointer("/params/arguments/query")
+                            .and_then(|q| q.as_str()).unwrap_or("");
+                        let results = search::search_phrases(&db_path, query, 10);
+                        let files: Vec<Value> = results.iter().map(|(fp, sc)| {
+                            json!({"file": fp, "score": sc})
+                        }).collect();
+                        json!({"candidates": files})
+                    }
+                    "hologram_plan" => {
+                        let task = request.pointer("/params/arguments/task")
+                            .and_then(|t| t.as_str()).unwrap_or("");
+                        let plan = structural_risk::hologram_plan(&db_path, task);
+                        plan
+                    }
+                    "who_calls" => {
+                        let call_name = request.pointer("/params/arguments/name")
+                            .and_then(|n| n.as_str()).unwrap_or("");
+                        let results = structural_risk::who_calls(&db_path, call_name);
+                        json!({"callers": results})
+                    }
+                    "latent_deps" => {
+                        let file = request.pointer("/params/arguments/file")
+                            .and_then(|f| f.as_str()).unwrap_or("");
+                        let results = structural_risk::latent_deps(&db_path, file);
+                        json!({"deps": results})
+                    }
+                    _ => {
+                        json!({"error": format!("Unknown tool: {}", name)})
+                    }
+                };
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "result": {
+                        "content": [{"type": "text", "text": serde_json::to_string(&result).unwrap_or_default()}]
+                    }
+                })
             }
             _ => {
-                make_result(id, &serde_json::json!({"ok": true}))
+                if req_id.is_some() {
+                    json!({"jsonrpc": "2.0", "id": req_id, "result": {}})
+                } else {
+                    continue;
+                }
             }
         };
 

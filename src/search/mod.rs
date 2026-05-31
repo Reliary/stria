@@ -68,7 +68,77 @@ fn file_module(file_path: &str) -> String {
 }
 
 /// Search the phrase index with full feature parity.
+/// Automatically re-queries with individual terms when the top result
+/// doesn't match all query terms (indicating a concentration problem).
 pub fn search_phrases(
+    db_path: &str,
+    query: &str,
+    top_n: usize,
+) -> Vec<(String, f64)> {
+    let results = _search_phrases(db_path, query, top_n);
+    
+    // Re-query trigger: does the top file path contain ALL raw query terms?
+    let raw_terms: Vec<String> = zone::extract_phrases(query);
+    let terms_lower: Vec<String> = raw_terms.iter().map(|t| t.to_lowercase()).collect();
+    
+    let needs_requery = if let Some((top_fp, _)) = results.first() {
+        let top_lower = top_fp.to_lowercase();
+        !terms_lower.iter().all(|t| top_lower.contains(t.as_str()))
+    } else {
+        true
+    };
+    
+    if needs_requery && raw_terms.len() >= 2 {
+        // Find the rarest term (highest IDF): search for that, then boost
+        // files whose paths contain the remaining terms.
+        let idf_db_result = Connection::open(db_path);
+        if idf_db_result.is_err() { return results; }
+        let idf_db = idf_db_result.unwrap();
+        let n_docs: f64 = idf_db.query_row("SELECT COUNT(*) FROM file_map", [], |r| r.get(0)).unwrap_or(1.0);
+        let term_idfs: Vec<(usize, f64)> = raw_terms.iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let df: f64 = idf_db.query_row(
+                    "SELECT COUNT(*) FROM phrase_occ po
+                     JOIN phrases p ON p.id = po.phrase_id
+                     WHERE p.phrase = ?1", [t], |r| r.get(0)
+                ).unwrap_or(0.0);
+                (i, (if df > 0.0 { ((n_docs - df + 0.5) / (df + 0.5) + 1.0).ln() } else { 10.0_f64 }))
+            }).collect();
+        drop(idf_db);
+        
+        let (best_idx, best_idf) = term_idfs.iter()
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .copied().unwrap_or((0, 0.0));
+        
+        if best_idf > 1.0 {
+            let best_term = &raw_terms[best_idx];
+            let other_terms: Vec<String> = raw_terms.iter()
+                .enumerate()
+                .filter(|(i, _)| *i != best_idx)
+                .map(|(_, t)| t.to_lowercase())
+                .collect();
+            
+            let single_results = _search_phrases(db_path, best_term, top_n * 5);
+            let mut reranked: Vec<(String, f64)> = single_results.iter()
+                .map(|(fp, score)| {
+                    let fp_lower = fp.to_lowercase();
+                    let term_count = 1.0 + other_terms.iter()
+                        .filter(|ot| fp_lower.contains(ot.as_str()))
+                        .count() as f64;
+                    (fp.clone(), score * (1.0 + term_count / raw_terms.len() as f64))
+                }).collect();
+            
+            reranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            reranked.truncate(top_n);
+            return reranked;
+        }
+    }
+    
+    results
+}
+
+fn _search_phrases(
     db_path: &str,
     query: &str,
     top_n: usize,
