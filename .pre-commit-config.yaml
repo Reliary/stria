@@ -1,0 +1,23 @@
+repos:
+  - repo: local
+    hooks:
+      - id: fmt
+        name: cargo fmt
+        description: Check Rust formatting
+        entry: cargo fmt --check
+        language: system
+        types: [rust]
+        pass_filenames: false
+      - id: clippy
+        name: cargo clippy
+        description: Lint Rust code with clippy
+        entry: cargo clippy --all-targets -- -D warnings
+        language: system
+        types: [rust]
+        pass_filenames: false
+      - id: gitleaks
+        name: gitleaks
+        description: Detect secrets in staged changes
+        entry: /home/linuxbrew/.linuxbrew/bin/gitleaks protect --staged -v
+        language: system
+        pass_filenames: false

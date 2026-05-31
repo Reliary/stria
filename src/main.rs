@@ -88,10 +88,7 @@ fn main() {
                 println!("{:.4}  {}", score, fp);
             }
         }
-        Commands::Serve {
-            repo,
-            cache_dir,
-        } => {
+        Commands::Serve { repo, cache_dir } => {
             let repo_path = Path::new(&repo);
             let canonical = repo_path
                 .canonicalize()
@@ -119,10 +116,7 @@ fn main() {
             );
             mcp_server(canonical.to_str().unwrap_or(&repo).to_string(), &out_dir);
         }
-        Commands::Watch {
-            repo,
-            cache_dir,
-        } => {
+        Commands::Watch { repo, cache_dir } => {
             let repo_path = Path::new(&repo);
             let canonical = repo_path
                 .canonicalize()
@@ -174,13 +168,15 @@ fn mcp_server(initial_repo: String, initial_out: &std::path::Path) {
     });
 
     let db_path_of = |cache: &std::path::Path| -> String {
-        cache.join("phrases.sqlite")
-            .to_str().unwrap_or("").to_string()
+        cache
+            .join("phrases.sqlite")
+            .to_str()
+            .unwrap_or("")
+            .to_string()
     };
 
     let bodies_path = |cache: &std::path::Path| -> String {
-        cache.join("bodies.db")
-            .to_str().unwrap_or("").to_string()
+        cache.join("bodies.db").to_str().unwrap_or("").to_string()
     };
 
     let tools = json!([
@@ -232,7 +228,6 @@ fn mcp_server(initial_repo: String, initial_out: &std::path::Path) {
             }
             "tools/call" => {
                 let st = state.lock().unwrap();
-                let repo = st.repo.clone();
                 let cache = st.cache_dir.clone();
                 let db_path = db_path_of(&cache);
                 drop(st);
