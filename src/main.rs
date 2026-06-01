@@ -95,7 +95,7 @@ fn main() {
                 .unwrap_or_else(|_| repo_path.to_path_buf());
             let out_dir = cache_dir
                 .as_ref()
-                .map(|c| Path::new(c).to_path_buf())
+                .map(|c| std::fs::canonicalize(c).unwrap_or_else(|_| Path::new(c).to_path_buf()))
                 .unwrap_or_else(|| canonical.join(".stria"));
             if !out_dir.join("phrases.sqlite").exists() {
                 match index::build_phrase_index(
@@ -123,7 +123,7 @@ fn main() {
                 .unwrap_or_else(|_| repo_path.to_path_buf());
             let out_dir = cache_dir
                 .as_ref()
-                .map(|c| Path::new(c).to_path_buf())
+                .map(|c| std::fs::canonicalize(c).unwrap_or_else(|_| Path::new(c).to_path_buf()))
                 .unwrap_or_else(|| canonical.join(".stria"));
             if !out_dir.join("phrases.sqlite").exists() {
                 match index::build_phrase_index(
@@ -155,16 +155,19 @@ fn main() {
 fn mcp_server(initial_repo: String, initial_out: &std::path::Path) {
     use serde_json::{json, Value};
     use std::io::{self, BufRead, Write};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
 
     struct ServerState {
         repo: String,
         cache_dir: std::path::PathBuf,
+        build_in_progress: AtomicBool,
     }
 
     let state = Mutex::new(ServerState {
         repo: initial_repo,
         cache_dir: initial_out.to_path_buf(),
+        build_in_progress: AtomicBool::new(false),
     });
 
     let db_path_of = |cache: &std::path::Path| -> String {
@@ -578,17 +581,37 @@ fn mcp_server(initial_repo: String, initial_out: &std::path::Path) {
                         } else {
                             let out_dir = std::path::Path::new(&canonical).join(".stria");
                             if !out_dir.join("phrases.sqlite").exists() {
-                                match index::build_phrase_index(&canonical, &out_dir, false) {
-                                    Ok(n) => {
-                                        let mut st = state.lock().unwrap();
-                                        st.repo = canonical;
-                                        st.cache_dir = out_dir;
-                                        drop(st);
-                                        json!({"status": "ok", "phrases": n})
+                                // Check if a build is already in progress
+                                let already_building = {
+                                    let st = state.lock().unwrap();
+                                    st.build_in_progress.load(Ordering::Relaxed)
+                                };
+                                if already_building {
+                                    json!({"error": "Index build already in progress for another repo"})
+                                } else {
+                                    {
+                                        let st = state.lock().unwrap();
+                                        st.build_in_progress.store(true, Ordering::Relaxed);
                                     }
-                                    Err(e) => {
-                                        json!({"error": format!("Index build failed: {}", e)})
-                                    }
+                                    let result = match index::build_phrase_index(
+                                        &canonical, &out_dir, false,
+                                    ) {
+                                        Ok(n) => {
+                                            let mut st = state.lock().unwrap();
+                                            st.repo = canonical;
+                                            st.cache_dir = out_dir;
+                                            st.build_in_progress.store(false, Ordering::Relaxed);
+                                            drop(st);
+                                            json!({"status": "ok", "phrases": n})
+                                        }
+                                        Err(e) => {
+                                            let st = state.lock().unwrap();
+                                            st.build_in_progress.store(false, Ordering::Relaxed);
+                                            drop(st);
+                                            json!({"error": format!("Index build failed: {}", e)})
+                                        }
+                                    };
+                                    result
                                 }
                             } else {
                                 let mut st = state.lock().unwrap();

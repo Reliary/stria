@@ -1,5 +1,7 @@
 use rusqlite::Connection;
 
+pub(crate) const SCHEMA_VERSION: i32 = 1;
+
 pub(crate) fn create_new_db(db: &Connection) -> rusqlite::Result<()> {
     db.execute_batch(
         "PRAGMA synchronous = OFF;
@@ -9,7 +11,8 @@ pub(crate) fn create_new_db(db: &Connection) -> rusqlite::Result<()> {
          PRAGMA temp_store = MEMORY;
          PRAGMA lock_timeout = 5000;",
     )?;
-    create_tables(db)
+    create_tables(db)?;
+    db.execute_batch(&format!("PRAGMA user_version = {}", SCHEMA_VERSION))
 }
 
 pub(crate) fn open_existing_db(db: &Connection) -> rusqlite::Result<()> {
@@ -20,7 +23,15 @@ pub(crate) fn open_existing_db(db: &Connection) -> rusqlite::Result<()> {
          PRAGMA mmap_size = 268435456;
          PRAGMA temp_store = MEMORY;
          PRAGMA lock_timeout = 5000;",
-    )
+    )?;
+    let version: i32 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version != SCHEMA_VERSION {
+        return Err(rusqlite::Error::InvalidColumnName(format!(
+            "Schema version mismatch: DB has {}, stria expects {}. Run `stria build` to upgrade.",
+            version, SCHEMA_VERSION
+        )));
+    }
+    Ok(())
 }
 
 fn create_tables(db: &Connection) -> rusqlite::Result<()> {

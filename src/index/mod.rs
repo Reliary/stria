@@ -207,7 +207,6 @@ pub fn build_phrase_index(repo_path: &str, out_dir: &Path, verbose: bool) -> Res
     } else {
         let db = Connection::open(&db_path).map_err(|e| format!("db: {}", e))?;
         schema::open_existing_db(&db).map_err(|e| format!("pragmas: {}", e))?;
-        schema::create_new_db(&db).ok(); // create tables if they don't exist
         (db, false)
     };
 
@@ -757,6 +756,8 @@ fn collect_source_files(repo: &Path) -> Vec<String> {
     ]
     .into();
 
+    const MAX_FILES: usize = 500_000;
+
     for entry in WalkDir::new(repo)
         .follow_links(false)
         .into_iter()
@@ -774,6 +775,9 @@ fn collect_source_files(repo: &Path) -> Vec<String> {
         };
         if !entry.file_type().is_file() {
             continue;
+        }
+        if files.len() >= MAX_FILES {
+            break;
         }
         let fname = entry.file_name().to_string_lossy();
         if lock_suffixes.contains(fname.as_ref()) {
@@ -798,6 +802,7 @@ fn collect_source_files(repo: &Path) -> Vec<String> {
         }
     }
     files.sort();
+    files.truncate(MAX_FILES);
     files
 }
 
