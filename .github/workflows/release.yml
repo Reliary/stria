@@ -50,7 +50,25 @@ jobs:
           else
             tar czf "$ARCHIVE" "$BIN"
           fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stria-${{ matrix.target }}
+          path: stria-*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: stria-*
+          merge-multiple: true
       - uses: softprops/action-gh-release@v2
         with:
-          files: stria-*
-          append: true
+          files: |
+            stria-*.tar.gz
+            stria-*.zip
+          generate_release_notes: true
