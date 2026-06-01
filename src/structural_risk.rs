@@ -82,7 +82,6 @@ pub fn who_calls(db_path: &str, name: &str) -> Vec<(String, f64)> {
         }
     }
 
-    db.close().ok();
     results
 }
 
@@ -144,11 +143,12 @@ pub fn latent_deps(db_path: &str, file: &str) -> Vec<(String, f64)> {
         )
         .ok();
 
-    if fid.is_none() {
-        db.close().ok();
-        return vec![];
-    }
-    let fid = fid.unwrap();
+    let fid = match fid {
+        Some(f) => f,
+        None => {
+            return vec![];
+        }
+    };
     let fp = file.to_string();
     let module = std::path::Path::new(&fp)
         .parent()
@@ -156,49 +156,64 @@ pub fn latent_deps(db_path: &str, file: &str) -> Vec<(String, f64)> {
         .unwrap_or_default();
 
     // Find rare phrases (df <= 3) that this file defines — unpack is_def in Rust
-    let mut rare_q = db
-        .prepare(
-            "SELECT p.phrase, po.flags FROM phrase_occ po
+    let mut rare_q = match db.prepare(
+        "SELECT p.phrase, po.flags FROM phrase_occ po
          JOIN phrases p ON p.id = po.phrase_id
          WHERE po.file_id = ?1
          AND (SELECT COUNT(*) FROM phrase_occ po2 WHERE po2.phrase_id = po.phrase_id) <= 3
          LIMIT 50",
-        )
-        .unwrap();
-    let rare_phrases: Vec<String> = rare_q
-        .query_map([fid], |r| {
-            let phrase = r.get::<_, String>(0)?;
-            let flags = r.get::<_, Vec<u8>>(1)?;
-            let f = if !flags.is_empty() { flags[0] } else { 0 };
-            Ok((phrase, schema::unpack_is_def(f)))
-        })
-        .unwrap()
-        .filter_map(|r| r.ok())
-        .filter(|(_, is_def)| *is_def == 1)
-        .map(|(phrase, _)| phrase)
-        .collect();
+    ) {
+        Ok(q) => q,
+        Err(e) => {
+            eprintln!("eh:warn: latent_deps: prepare rare_q failed: {}", e);
+            return vec![];
+        }
+    };
+    let rare_phrases: Vec<String> = match rare_q.query_map([fid], |r| {
+        let phrase = r.get::<_, String>(0)?;
+        let flags = r.get::<_, Vec<u8>>(1)?;
+        let f = if !flags.is_empty() { flags[0] } else { 0 };
+        Ok((phrase, schema::unpack_is_def(f)))
+    }) {
+        Ok(rows) => rows
+            .filter_map(|r| r.ok())
+            .filter(|(_, is_def)| *is_def == 1)
+            .map(|(phrase, _)| phrase)
+            .collect(),
+        Err(e) => {
+            eprintln!("eh:warn: latent_deps: rare_q query failed: {}", e);
+            return vec![];
+        }
+    };
     drop(rare_q);
 
     if rare_phrases.is_empty() {
-        db.close().ok();
         return vec![];
     }
 
     let mut score_map: HashMap<String, f64> = HashMap::new();
     for phrase in &rare_phrases {
-        let mut stmt = db
-            .prepare(
-                "SELECT fm.file_path
+        let mut stmt = match db.prepare(
+            "SELECT fm.file_path
              FROM phrase_occ po
              JOIN phrases p ON p.id = po.phrase_id
              JOIN file_map fm ON fm.id = po.file_id
              WHERE p.phrase = ?1 AND po.file_id != ?2
              LIMIT 10",
-            )
-            .unwrap();
-        let rows = stmt
-            .query_map(rusqlite::params![phrase, fid], |r| r.get::<_, String>(0))
-            .unwrap();
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("eh:warn: latent_deps: inner prepare failed: {}", e);
+                continue;
+            }
+        };
+        let rows = match stmt.query_map(rusqlite::params![phrase, fid], |r| r.get::<_, String>(0)) {
+            Ok(rows) => rows,
+            Err(e) => {
+                eprintln!("eh:warn: latent_deps: inner query failed: {}", e);
+                continue;
+            }
+        };
         for row in rows.flatten() {
             let other_module = std::path::Path::new(&row)
                 .parent()
@@ -225,30 +240,38 @@ pub fn blast_radius(db_path: &str, file: &str) -> Vec<(String, f64)> {
     };
 
     // Get distinctive phrases (is_def > 0) — unpack in Rust
-    let mut phrase_q = db
-        .prepare(
-            "SELECT p.phrase, po.flags,
-                COALESCE(oc.count, 1) as effective_count
+    let mut phrase_q = match db.prepare(
+        "SELECT p.phrase, po.flags,
+            COALESCE(oc.count, 1) as effective_count
          FROM phrase_occ po
          JOIN phrases p ON p.id = po.phrase_id
          LEFT JOIN count_overflow oc ON oc.phrase_id = po.phrase_id AND oc.file_id = po.file_id
          WHERE po.file_id=?1 LIMIT 50",
-        )
-        .unwrap();
-    let phrases: Vec<(String, f64)> = phrase_q
-        .query_map([fid], |r| {
-            let phrase = r.get::<_, String>(0)?;
-            let flags = r.get::<_, Vec<u8>>(1)?;
-            let count = r.get::<_, f64>(2)?;
-            let f = if !flags.is_empty() { flags[0] } else { 0 };
-            let is_def = schema::unpack_is_def(f);
-            Ok((phrase, count, is_def))
-        })
-        .unwrap()
-        .filter_map(|r| r.ok())
-        .filter(|(_, _, is_def)| *is_def > 0)
-        .map(|(phrase, count, _)| (phrase, count))
-        .collect();
+    ) {
+        Ok(q) => q,
+        Err(e) => {
+            eprintln!("eh:warn: blast_radius: prepare failed: {}", e);
+            return vec![];
+        }
+    };
+    let phrases: Vec<(String, f64)> = match phrase_q.query_map([fid], |r| {
+        let phrase = r.get::<_, String>(0)?;
+        let flags = r.get::<_, Vec<u8>>(1)?;
+        let count = r.get::<_, f64>(2)?;
+        let f = if !flags.is_empty() { flags[0] } else { 0 };
+        let is_def = schema::unpack_is_def(f);
+        Ok((phrase, count, is_def))
+    }) {
+        Ok(rows) => rows
+            .filter_map(|r| r.ok())
+            .filter(|(_, _, is_def)| *is_def > 0)
+            .map(|(phrase, count, _)| (phrase, count))
+            .collect(),
+        Err(e) => {
+            eprintln!("eh:warn: blast_radius: query failed: {}", e);
+            return vec![];
+        }
+    };
     drop(phrase_q);
 
     if phrases.is_empty() {
@@ -257,18 +280,24 @@ pub fn blast_radius(db_path: &str, file: &str) -> Vec<(String, f64)> {
 
     let mut other_scores: HashMap<i64, f64> = HashMap::new();
     for (phrase, count) in &phrases {
-        let mut q = db
-            .prepare(
-                "SELECT po.file_id FROM phrase_occ po
+        let mut q = match db.prepare(
+            "SELECT po.file_id FROM phrase_occ po
              JOIN phrases p ON p.id = po.phrase_id
              WHERE p.phrase=?1 AND po.file_id!=?2 LIMIT 10",
-            )
-            .unwrap();
-        let rows: Vec<i64> = q
-            .query_map(params![phrase, fid], |r| r.get::<_, i64>(0))
-            .unwrap()
-            .filter_map(|r| r.ok())
-            .collect();
+        ) {
+            Ok(q) => q,
+            Err(e) => {
+                eprintln!("eh:warn: blast_radius: inner prepare failed: {}", e);
+                continue;
+            }
+        };
+        let rows: Vec<i64> = match q.query_map(params![phrase, fid], |r| r.get::<_, i64>(0)) {
+            Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+            Err(e) => {
+                eprintln!("eh:warn: blast_radius: inner query failed: {}", e);
+                continue;
+            }
+        };
         drop(q);
         for ofid in rows {
             *other_scores.entry(ofid).or_insert(0.0) += count;
@@ -325,12 +354,13 @@ pub fn build_file_index(db_path: &str) -> Vec<String> {
         Ok(s) => s,
         Err(_) => return vec![],
     };
-    let files: Vec<String> = stmt
-        .query_map([], |r| r.get::<_, String>(0))
-        .unwrap()
-        .filter_map(|r| r.ok())
-        .collect();
-    drop(stmt);
+    let files: Vec<String> = match stmt.query_map([], |r| r.get::<_, String>(0)) {
+        Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+        Err(e) => {
+            eprintln!("eh:warn: build_file_index: query failed: {}", e);
+            return vec![];
+        }
+    };
     // db closes on drop
     files
 }
@@ -422,7 +452,7 @@ pub fn find_verify_candidates(db_path: &str, file: &str) -> Vec<(String, f64)> {
     };
 
     // Get overlapping phrases with is_def>0 from test files — unpack in Rust
-    let mut stmt = db.prepare(
+    let mut stmt = match db.prepare(
         "SELECT fm.file_path, po2.flags
          FROM phrase_occ po1
          JOIN phrase_occ po2 ON po2.phrase_id = po1.phrase_id AND po2.file_id != po1.file_id
@@ -430,17 +460,27 @@ pub fn find_verify_candidates(db_path: &str, file: &str) -> Vec<(String, f64)> {
          WHERE po1.file_id = ?1
            AND (fm.file_path LIKE '%test%' OR fm.file_path LIKE '%spec%' OR fm.file_path LIKE '%__tests__%')
          LIMIT 500"
-    ).unwrap();
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("eh:warn: find_verify_candidates: prepare failed: {}", e);
+            return vec![];
+        }
+    };
 
     let mut overlap_map: HashMap<String, f64> = HashMap::new();
-    let rows = stmt
-        .query_map([fid], |r| {
-            let fp = r.get::<_, String>(0)?;
-            let flags = r.get::<_, Vec<u8>>(1)?;
-            let f = if !flags.is_empty() { flags[0] } else { 0 };
-            Ok((fp, schema::unpack_is_def(f)))
-        })
-        .unwrap();
+    let rows = match stmt.query_map([fid], |r| {
+        let fp = r.get::<_, String>(0)?;
+        let flags = r.get::<_, Vec<u8>>(1)?;
+        let f = if !flags.is_empty() { flags[0] } else { 0 };
+        Ok((fp, schema::unpack_is_def(f)))
+    }) {
+        Ok(rows) => rows,
+        Err(e) => {
+            eprintln!("eh:warn: find_verify_candidates: query failed: {}", e);
+            return vec![];
+        }
+    };
     for row in rows.filter_map(|r| r.ok()) {
         let (fp, is_def) = row;
         if is_def > 0 {
@@ -480,21 +520,26 @@ pub fn hologram_plan(db_path: &str, task: &str) -> serde_json::Value {
              WHERE p.phrase = ?1
              LIMIT 50",
         ) {
-            let rows = stmt
-                .query_map([st], |r| {
-                    let fp = r.get::<_, String>(0)?;
-                    let flags = r.get::<_, Vec<u8>>(1)?;
-                    let doc_len = r.get::<_, f64>(2)?;
-                    let f = if !flags.is_empty() { flags[0] } else { 0 };
-                    let base_count = schema::unpack_count(f);
-                    let tf = if base_count >= 31 {
-                        1.0
-                    } else {
-                        base_count as f64
-                    };
-                    Ok((fp, tf, schema::unpack_is_def(f), doc_len))
-                })
-                .unwrap();
+            let rows_result = stmt.query_map([st], |r| {
+                let fp = r.get::<_, String>(0)?;
+                let flags = r.get::<_, Vec<u8>>(1)?;
+                let doc_len = r.get::<_, f64>(2)?;
+                let f = if !flags.is_empty() { flags[0] } else { 0 };
+                let base_count = schema::unpack_count(f);
+                let tf = if base_count >= 31 {
+                    1.0
+                } else {
+                    base_count as f64
+                };
+                Ok((fp, tf, schema::unpack_is_def(f), doc_len))
+            });
+            let rows = match rows_result {
+                Ok(rows) => rows,
+                Err(e) => {
+                    eprintln!("eh:warn: hologram_plan: query_map failed: {}", e);
+                    continue;
+                }
+            };
             for row in rows.flatten() {
                 let (fp, tf, is_def, doc_len) = row;
                 let idf = crate::search::bm25::bm25_idf(n_docs, 5.0);

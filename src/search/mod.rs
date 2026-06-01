@@ -309,39 +309,44 @@ fn _search_phrases(db_path: &str, query: &str, top_n: usize) -> Vec<(String, f64
             Ok(q) => q,
             Err(_) => continue,
         };
-        let rows_result = exact_q
-            .query_map([st], |r| {
-                let fid = r.get::<_, i64>(0)?;
-                let flags = r.get::<_, Vec<u8>>(1)?;
-                let line_blob = r.get::<_, Vec<u8>>(2)?;
-                let doc_len = r.get::<_, f64>(3)?;
-                let uniq_def = r.get::<_, i64>(4)?;
-                let total_def = r.get::<_, i64>(5)?;
-                let comment_ratio = r.get::<_, f64>(6)?;
-                let overflow_count = r.get::<_, u32>(7)?;
-                let f = if !flags.is_empty() { flags[0] } else { 0 };
-                let is_def = schema::unpack_is_def(f);
-                let zone_int = schema::unpack_zone_int(f);
-                let base_count = schema::unpack_count(f);
-                let tf = if base_count >= 31 {
-                    overflow_count as f64
-                } else {
-                    base_count as f64
-                };
-                let first_line = schema::unpack_line_nos(&line_blob) as i32;
-                Ok((
-                    fid,
-                    tf,
-                    is_def,
-                    zone_int,
-                    doc_len,
-                    uniq_def,
-                    total_def,
-                    comment_ratio,
-                    first_line,
-                ))
-            })
-            .unwrap();
+        let rows_result = exact_q.query_map([st], |r| {
+            let fid = r.get::<_, i64>(0)?;
+            let flags = r.get::<_, Vec<u8>>(1)?;
+            let line_blob = r.get::<_, Vec<u8>>(2)?;
+            let doc_len = r.get::<_, f64>(3)?;
+            let uniq_def = r.get::<_, i64>(4)?;
+            let total_def = r.get::<_, i64>(5)?;
+            let comment_ratio = r.get::<_, f64>(6)?;
+            let overflow_count = r.get::<_, u32>(7)?;
+            let f = if !flags.is_empty() { flags[0] } else { 0 };
+            let is_def = schema::unpack_is_def(f);
+            let zone_int = schema::unpack_zone_int(f);
+            let base_count = schema::unpack_count(f);
+            let tf = if base_count >= 31 {
+                overflow_count as f64
+            } else {
+                base_count as f64
+            };
+            let first_line = schema::unpack_line_nos(&line_blob) as i32;
+            Ok((
+                fid,
+                tf,
+                is_def,
+                zone_int,
+                doc_len,
+                uniq_def,
+                total_def,
+                comment_ratio,
+                first_line,
+            ))
+        });
+        let rows_result = match rows_result {
+            Ok(rows) => rows,
+            Err(e) => {
+                eprintln!("eh:warn: search: exact query_map failed: {}", e);
+                continue;
+            }
+        };
         for row in rows_result.filter_map(|r| r.ok()) {
             let (
                 fid,
@@ -406,26 +411,31 @@ fn _search_phrases(db_path: &str, query: &str, top_n: usize) -> Vec<(String, f64
             Err(_) => continue,
         };
         let mut max_per_file: HashMap<i64, f64> = HashMap::new();
-        let prefix_rows = prefix_q
-            .query_map(params![&pattern, st], |r| {
-                let fid = r.get::<_, i64>(0)?;
-                let flags = r.get::<_, Vec<u8>>(1)?;
-                let doc_len = r.get::<_, f64>(2)?;
-                let uniq_def = r.get::<_, i64>(3)?;
-                let total_def = r.get::<_, i64>(4)?;
-                let comment_ratio = r.get::<_, f64>(5)?;
-                let f = if !flags.is_empty() { flags[0] } else { 0 };
-                Ok((
-                    fid,
-                    schema::unpack_is_def(f),
-                    schema::unpack_zone_int(f),
-                    doc_len,
-                    uniq_def,
-                    total_def,
-                    comment_ratio,
-                ))
-            })
-            .unwrap();
+        let prefix_result = prefix_q.query_map(params![&pattern, st], |r| {
+            let fid = r.get::<_, i64>(0)?;
+            let flags = r.get::<_, Vec<u8>>(1)?;
+            let doc_len = r.get::<_, f64>(2)?;
+            let uniq_def = r.get::<_, i64>(3)?;
+            let total_def = r.get::<_, i64>(4)?;
+            let comment_ratio = r.get::<_, f64>(5)?;
+            let f = if !flags.is_empty() { flags[0] } else { 0 };
+            Ok((
+                fid,
+                schema::unpack_is_def(f),
+                schema::unpack_zone_int(f),
+                doc_len,
+                uniq_def,
+                total_def,
+                comment_ratio,
+            ))
+        });
+        let prefix_rows = match prefix_result {
+            Ok(rows) => rows,
+            Err(e) => {
+                eprintln!("eh:warn: search: prefix query_map failed: {}", e);
+                continue;
+            }
+        };
         for row in prefix_rows.filter_map(|r| r.ok()) {
             let (fid, is_def, zone_int, doc_len, uniq_def, total_def, comment_ratio) = row;
             let tf = 1.0;
@@ -479,22 +489,27 @@ fn _search_phrases(db_path: &str, query: &str, top_n: usize) -> Vec<(String, f64
             Err(_) => continue,
         };
         let mut max_per_file: HashMap<i64, f64> = HashMap::new();
-        let sub_rows = sub_q
-            .query_map(params![&pattern, &excl_prefix, st], |r| {
-                let fid = r.get::<_, i64>(0)?;
-                let flags = r.get::<_, Vec<u8>>(1)?;
-                let doc_len = r.get::<_, f64>(2)?;
-                let comment_ratio = r.get::<_, f64>(3)?;
-                let f = if !flags.is_empty() { flags[0] } else { 0 };
-                Ok((
-                    fid,
-                    schema::unpack_is_def(f),
-                    schema::unpack_zone_int(f),
-                    doc_len,
-                    comment_ratio,
-                ))
-            })
-            .unwrap();
+        let sub_result = sub_q.query_map(params![&pattern, &excl_prefix, st], |r| {
+            let fid = r.get::<_, i64>(0)?;
+            let flags = r.get::<_, Vec<u8>>(1)?;
+            let doc_len = r.get::<_, f64>(2)?;
+            let comment_ratio = r.get::<_, f64>(3)?;
+            let f = if !flags.is_empty() { flags[0] } else { 0 };
+            Ok((
+                fid,
+                schema::unpack_is_def(f),
+                schema::unpack_zone_int(f),
+                doc_len,
+                comment_ratio,
+            ))
+        });
+        let sub_rows = match sub_result {
+            Ok(rows) => rows,
+            Err(e) => {
+                eprintln!("eh:warn: search: substring query_map failed: {}", e);
+                continue;
+            }
+        };
         for row in sub_rows.filter_map(|r| r.ok()) {
             let (fid, is_def, zone_int, doc_len, comment_ratio) = row;
             let tf = 1.0;
