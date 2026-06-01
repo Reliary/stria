@@ -28,24 +28,24 @@ jobs:
         with:
           toolchain: stable
           targets: ${{ matrix.target }}
+      - name: Install cross-compilation deps
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq gcc-aarch64-linux-gnu
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
       - name: Package
         shell: bash
         run: |
-          BIN="stria"
-          SUFFIX=""
-          if [[ "${{ matrix.target }}" == *-windows-* ]]; then SUFFIX=".exe"; fi
+          BIN="stria${{ contains(matrix.target, 'windows') && '.exe' || '' }}"
           ARCHIVE="stria-${{ matrix.target }}.tar.gz"
           if [[ "${{ matrix.target }}" == *-windows-* ]]; then ARCHIVE="stria-${{ matrix.target }}.zip"; fi
-          mkdir -p dist
-          cp "target/${{ matrix.target }}/release/${BIN}${SUFFIX}" dist/
-          cd dist
+          cp "target/${{ matrix.target }}/release/$BIN" "$BIN"
           if [[ "${{ matrix.target }}" == *-windows-* ]]; then
-            7z a "../$ARCHIVE" "${BIN}${SUFFIX}"
+            7z a "$ARCHIVE" "$BIN"
           else
-            tar czf "../$ARCHIVE" "${BIN}${SUFFIX}"
+            tar czf "$ARCHIVE" "$BIN"
           fi
       - uses: softprops/action-gh-release@v2
         with:
           files: stria-*
+          append: true
