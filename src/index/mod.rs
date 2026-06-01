@@ -1,8 +1,8 @@
 pub(crate) mod schema;
 
-use fxhash::{FxHashMap, FxHasher};
 use rayon::prelude::*;
 use rusqlite::{params, Connection};
+use rustc_hash::{FxHashMap, FxHasher};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
