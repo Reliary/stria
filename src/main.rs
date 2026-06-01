@@ -51,10 +51,13 @@ enum Commands {
         #[arg(long)]
         cache_dir: Option<String>,
     },
-    /// Detect agents and add stria MCP server entry
+    /// Detect agents and add stria MCP server entry; optionally add .stria/ to .gitignore
     Setup {
         #[arg(long, default_value = "false")]
         yes: bool,
+        /// Repo root for .gitignore update. Skips .gitignore if not set.
+        #[arg(long)]
+        repo: Option<String>,
     },
     /// Remove stria from agent configurations
     Remove {
@@ -143,7 +146,10 @@ fn main() {
                 eprintln!("Watch error: {}", e);
             }
         }
-        Commands::Setup { yes } => {
+        Commands::Setup { yes, repo } => {
+            if let Some(r) = &repo {
+                setup::add_to_gitignore(r);
+            }
             setup::run_setup(yes);
         }
         Commands::Remove { yes } => {

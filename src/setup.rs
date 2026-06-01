@@ -131,6 +131,48 @@ pub fn find_configured_agents() -> Vec<(&'static str, String)> {
     found
 }
 
+/// Add .stria/ to .gitignore for a repo.
+/// Returns true if .gitignore was modified.
+pub fn add_to_gitignore(repo_path: &str) -> bool {
+    let gitignore_path = std::path::Path::new(repo_path).join(".gitignore");
+    let stria_dir = ".stria";
+
+    // Read existing or start fresh
+    let mut content = if gitignore_path.exists() {
+        match std::fs::read_to_string(&gitignore_path) {
+            Ok(c) => c,
+            Err(_) => return false,
+        }
+    } else {
+        String::new()
+    };
+
+    // Check if .stria/ is already listed
+    for line in content.lines() {
+        if line.trim() == stria_dir {
+            return false; // already present
+        }
+    }
+
+    // Append
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
+    content.push_str(stria_dir);
+    content.push('\n');
+
+    match std::fs::write(&gitignore_path, content) {
+        Ok(_) => {
+            eprintln!("  Added {} to .gitignore", stria_dir);
+            true
+        }
+        Err(e) => {
+            eprintln!("  Warning: could not write .gitignore: {}", e);
+            false
+        }
+    }
+}
+
 pub fn run_setup(yes: bool) {
     let found = detect_agents_without_stria();
     if found.is_empty() {
